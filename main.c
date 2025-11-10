@@ -1502,116 +1502,226 @@ static void save_history(const host_stats_t *host)
     }
 }
 
-void generate_svg_response(int client_sock, int is_online, float uptime) {
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 开始生成 SVG 响应 (is_online=%d, uptime=%.2f%%)\n",   
-                timestamp(), is_online, uptime);  
-    }      
-    char svg[4096];      
-    int len = 0;      
+void generate_svg_response(int client_sock, int is_online, float uptime,       
+                          int v1_ok, int v2_ok, int v2s_ok, int v3_ok) {    
+    if (verbose) {      
+        fprintf(stderr, "[%s] [DEBUG]: 开始生成 SVG 响应 (is_online=%d, uptime=%.2f%%, v1=%d, v2=%d, v2s=%d, v3=%d)\n",       
+                timestamp(), is_online, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);      
+    }          
+    char svg[4096];          
+    int len = 0;          
+              
+    // HTTP 头          
+    len += snprintf(svg + len, sizeof(svg) - len,          
+        "HTTP/1.1 200 OK\r\n"          
+        "Content-Type: image/svg+xml; charset=utf-8\r\n"          
+        "Connection: close\r\n\r\n");          
           
-    // HTTP 头      
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "HTTP/1.1 200 OK\r\n"      
-        "Content-Type: image/svg+xml; charset=utf-8\r\n"      
-        "Connection: close\r\n\r\n");      
-      
-    // 计算文字宽度（近似值）  
-    const char *status_text = is_online ? "在线" : "离线";  
-    int status_label_width = 32;  // "状态" 两个字  
-    int status_value_width = 22;  // "在线"/"离线" 两个字  
-    int uptime_label_width = 44;  // "连通率" 三个字  
-    int uptime_value_width = uptime >= 100 ? 33 : (uptime >= 10 ? 28 : 23);  
-      
-    int status_total = status_label_width + status_value_width + 16;  
-    int uptime_total = uptime >= 0 ? (uptime_label_width + uptime_value_width + 16) : 0;  
-    int total_width = status_total + uptime_total;  
-      
-    // SVG 内容      
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"20\">\n",      
-        total_width);      
-          
-    // 状态徽章 - 左侧部分（左边圆角，右边直角）  
-    const char *status_color = is_online ? "#4ade80" : "#ef4444"; 
-    
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 状态徽章颜色: %s (状态文字: %s)\n",  
-                timestamp(), status_color, status_text);  
-    } 
-      
-    len += snprintf(svg + len, sizeof(svg) - len,  
-        "  <path d=\"M 3 0 L %d 0 L %d 20 L 3 20 Q 0 20 0 17 L 0 3 Q 0 0 3 0 Z\" fill=\"#555\"/>\n",  
-        status_label_width + 8, status_label_width + 8);  
-      
-    // 状态徽章 - 右侧部分（左边直角，右边圆角）  
-    int status_right = status_total - 3;  
-    len += snprintf(svg + len, sizeof(svg) - len,  
-        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",  
-        status_label_width + 8, status_right, status_total, status_total,   
-        status_total, status_total, status_right, status_label_width + 8, status_label_width + 8,  
-        status_color);  
-      
-    // 状态徽章文字 - 修正居中位置  
-    int status_label_center = (status_label_width + 8) / 2;  // 左侧矩形中心  
-    int status_value_center = status_label_width + 8 + (status_total - status_label_width - 8) / 2;  // 右侧矩形中心  
-      
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">状态</text>\n"      
-        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%s</text>\n",      
-        status_label_center,  
-        status_value_center,  
-        status_text);      
-          
-    // 连通率徽章(如果有历史记录)  
-    if (uptime >= 0) {    
-        // 使用与主页相同的动态颜色计算公式  
-        int hue = 10 + (int)(uptime * 0.8);  
-        char uptime_color[32];    
-        snprintf(uptime_color, sizeof(uptime_color), "hsl(%d, 90%%, 50%%)", hue);  
+    // 计算文字宽度（近似值）      
+    const char *status_text = is_online ? "在线" : "离线";      
+    int status_label_width = 32;      
+    int status_value_width = 22;      
+    int uptime_label_width = 44;      
+    int uptime_value_width = uptime >= 100 ? 33 : (uptime >= 10 ? 28 : 23);     
         
-        if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: 连通率徽章: uptime=%.2f%%, hue=%d, color=%s\n",  
-                    timestamp(), uptime, hue, uptime_color);  
-        }  
+    // 计算版本徽章宽度      
+    int version_label_width = 32;      
+    int version_count = v1_ok + v2_ok + v2s_ok + v3_ok;      
+    int version_value_width = 0;      
+    if (version_count > 0) {      
+        version_value_width = version_count * 22 + (version_count - 1) * 2;      
+    } else {      
+        version_value_width = 28;      
+    }    
+      
+    int badge_gap = 1;  // 徽章之间的间距  
+    int status_total = status_label_width + status_value_width + 16;      
+    int uptime_total = uptime >= 0 ? (uptime_label_width + uptime_value_width + 16) : 0;    
+    int version_total = version_label_width + version_value_width + 16;       
+    int total_width = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + version_total + badge_gap;     
+        
+    if (verbose) {    
+        fprintf(stderr, "[%s] [DEBUG]: SVG 尺寸: status=%d, uptime=%d, version=%d, total=%d\n",    
+                timestamp(), status_total, uptime_total, version_total, total_width);    
+    }    
           
-        int uptime_start = status_total;  
-        int uptime_mid = uptime_start + uptime_label_width + 8;  
-        int uptime_end = total_width;  
+    // SVG 内容          
+    len += snprintf(svg + len, sizeof(svg) - len,          
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"20\">\n",          
+        total_width);      
+            
+    // ========== 状态徽章（独立，左右圆角）==========  
+    const char *status_color = is_online ? "#4ade80" : "#ef4444";     
+        
+    if (verbose) {      
+        fprintf(stderr, "[%s] [DEBUG]: 状态徽章颜色: %s (状态文字: %s)\n",      
+                timestamp(), status_color, status_text);      
+    }     
+      
+    // 状态徽章 - 左侧部分（左边圆角，右边直角）  
+    len += snprintf(svg + len, sizeof(svg) - len,      
+        "  <path d=\"M 5 0 L %d 0 L %d 20 L 3 20 Q 0 20 0 17 L 0 3 Q 0 0 5 0 Z\" fill=\"#555\"/>\n",      
+        status_label_width + 8, status_label_width + 8);      
           
+    // 状态徽章 - 右侧部分（左边直角，右边圆角）  
+    int status_right = status_total - 5;  
+    len += snprintf(svg + len, sizeof(svg) - len,      
+        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",      
+        status_label_width + 8, status_right, status_total, status_total,  
+        status_total, status_total, status_right, status_label_width + 8, status_label_width + 8,  
+        status_color);      
+          
+    // 状态徽章文字      
+    int status_label_center = (status_label_width + 8) / 2;      
+    int status_value_center = status_label_width + 8 + (status_total - status_label_width - 8) / 2;      
+          
+    len += snprintf(svg + len, sizeof(svg) - len,          
+        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">状态</text>\n"          
+        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%s</text>\n",          
+        status_label_center,      
+        status_value_center,      
+        status_text);          
+              
+    // ========== 连通率徽章（独立，左右圆角）==========  
+    if (uptime >= 0) {        
+        int hue = 10 + (int)(uptime * 0.8);      
+        char uptime_color[32];        
+        snprintf(uptime_color, sizeof(uptime_color), "hsl(%d, 90%%, 50%%)", hue);      
+            
+        if (verbose) {      
+            fprintf(stderr, "[%s] [DEBUG]: 连通率徽章: uptime=%.2f%%, hue=%d, color=%s\n",      
+                    timestamp(), uptime, hue, uptime_color);      
+        }      
+              
+        int uptime_start = status_total + badge_gap;      
+        int uptime_mid = uptime_start + uptime_label_width + 8;      
+        int uptime_end = uptime_start + uptime_total;  
+              
         // 连通率徽章 - 左侧部分（左边圆角，右边直角）  
-        len += snprintf(svg + len, sizeof(svg) - len,  
-            "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",  
-            uptime_start + 3, uptime_mid, uptime_mid, uptime_start + 3,  
-            uptime_start, uptime_start, uptime_start, uptime_start, uptime_start + 3);  
-          
-        // 连通率徽章 - 右侧部分（左边直角，右边圆角）  
-        len += snprintf(svg + len, sizeof(svg) - len,  
-            "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",  
-            uptime_mid, uptime_end - 3, uptime_end, uptime_end,  
-            uptime_end, uptime_end, uptime_end - 3, uptime_mid, uptime_mid,  
-            uptime_color);  
-          
-        // 连通率徽章文字 - 修正居中位置  
-        int uptime_label_center = uptime_start + (uptime_mid - uptime_start) / 2;  // 左侧矩形中心  
-        int uptime_value_center = uptime_mid + (uptime_end - uptime_mid) / 2;  // 右侧矩形中心  
-          
         len += snprintf(svg + len, sizeof(svg) - len,      
-            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">连通率</text>\n"      
-            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%.0f%%</text>\n",      
-            uptime_label_center,  
-            uptime_value_center,  
-            uptime);      
-    }      
+            "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",      
+            uptime_start + 5, uptime_mid, uptime_mid, uptime_start + 5,  
+            uptime_start, uptime_start, uptime_start, uptime_start, uptime_start + 5);      
+              
+        // 连通率徽章 - 右侧部分（左边直角，右边圆角）  
+        int uptime_right = uptime_end - 5;  
+        len += snprintf(svg + len, sizeof(svg) - len,      
+            "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",      
+            uptime_mid, uptime_right, uptime_end, uptime_end,  
+            uptime_end, uptime_end, uptime_right, uptime_mid, uptime_mid,  
+            uptime_color);      
+              
+        // 连通率徽章文字    
+        int uptime_label_center = uptime_start + (uptime_mid - uptime_start) / 2;      
+        int uptime_value_center = uptime_mid + (uptime_end - uptime_mid) / 2;      
+              
+        len += snprintf(svg + len, sizeof(svg) - len,          
+            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">连通率</text>\n"          
+            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%.0f%%</text>\n",          
+            uptime_label_center,      
+            uptime_value_center,      
+            uptime);          
+    }          
+    if (is_online) {    
+    // ========== 版本徽章（独立，左右圆角）==========  
+    int version_start = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + badge_gap;      
+    int version_mid = version_start + version_label_width + 8;      
+    int version_end = version_start + version_total;      
+        
+    if (verbose) {    
+        fprintf(stderr, "[%s] [DEBUG]: 版本徽章位置: start=%d, mid=%d, end=%d\n",    
+                timestamp(), version_start, version_mid, version_end);    
+    }    
+         
+    // 版本徽章 - 左侧部分（左边圆角，右边直角）      
+    len += snprintf(svg + len, sizeof(svg) - len,      
+        "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",      
+        version_start + 5, version_mid, version_mid, version_start + 5,  
+        version_start, version_start, version_start, version_start, version_start + 5);   
+        
+    // 根据检测到的版本确定背景颜色  
+    const char *version_bg_color;  
+    if (version_count == 1) {  
+        // 只检测到一个版本，使用对应颜色  
+        if (v1_ok) {  
+            version_bg_color = "#7c3aed";  // v1 紫色  
+        } else if (v2_ok) {  
+            version_bg_color = "#0284c7";  // v2 深蓝色  
+        } else if (v2s_ok) {  
+            version_bg_color = "#0369a1";  // v2s 中蓝色  
+        } else {  // v3_ok  
+            version_bg_color = "#d97706";  // v3 橙色  
+        }  
+    } else if (version_count > 1) {  
+        // 检测到多个版本，使用红色  
+        version_bg_color = "#ef4444";  
+    } else {  
+        // 未检测到任何版本，使用红色  
+        version_bg_color = "#ef4444";  
+    }    
           
-    len += snprintf(svg + len, sizeof(svg) - len, "</svg>\n");
-    
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: SVG 生成完成，总长度: %d 字节\n", timestamp(), len);  
-    }      
+    // 版本徽章 - 右侧部分（左边直角，右边圆角）- 使用动态背景颜色  
+    int version_right = version_end - 5;    
+    len += snprintf(svg + len, sizeof(svg) - len,        
+        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",        
+            version_mid, version_right, version_end, version_end,        
+            version_end, version_end, version_right, version_mid, version_mid,  
+            version_bg_color);  // 使用动态颜色      
           
-    send(client_sock, svg, len, 0);      
-    close(client_sock);      
+    // 版本徽章文字      
+    int version_label_center = version_start + (version_mid - version_start) / 2;      
+    len += snprintf(svg + len, sizeof(svg) - len,      
+        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">版本</text>\n",      
+    		version_label_center);      
+          
+    // 生成版本标签 
+    if (version_count > 0) {      
+        int x_offset = version_mid + 4;      
+          
+        if (v1_ok) {      
+            len += snprintf(svg + len, sizeof(svg) - len,      
+                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v1</text>\n",      
+            	 x_offset + 5);     
+            x_offset += 24;      
+        }      
+          
+        if (v2_ok) {      
+            len += snprintf(svg + len, sizeof(svg) - len,      
+                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2</text>\n",      
+            	 x_offset + 5);     
+            x_offset += 24;      
+        }      
+          
+        if (v2s_ok) {      
+            // v2s: 中蓝色背景 #0369a1  
+            len += snprintf(svg + len, sizeof(svg) - len,      
+                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2s</text>\n",      
+            	 x_offset + 6);      
+            x_offset += 28;      
+        }      
+          
+        if (v3_ok) {      
+            // v3: 橙色背景 #d97706  
+            len += snprintf(svg + len, sizeof(svg) - len,      
+                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v3</text>\n",      
+            	 x_offset + 5);     
+        }      
+    } else {      
+        // 未知版本：使用红色背景 #ef4444  
+        int version_value_center = version_mid + (version_value_width + 8) / 2;      
+        len += snprintf(svg + len, sizeof(svg) - len,      
+            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">未知</text>\n",      
+        	version_value_center);      
+    }        
+    }         
+    len += snprintf(svg + len, sizeof(svg) - len, "</svg>\n");    
+        
+    if (verbose) {      
+        fprintf(stderr, "[%s] [DEBUG]: SVG 生成完成，总长度: %d 字节\n", timestamp(), len);      
+    }          
+              
+    send(client_sock, svg, len, 0);          
+    close(client_sock);          
 }
   
 void send_error_response(int client_sock, const char *message) {  
@@ -1693,7 +1803,7 @@ void handle_api_request(int client_sock, const char *path) {
     pthread_mutex_unlock(&g_state.lock);  
       
     // 生成 SVG 响应  
-    generate_svg_response(client_sock, result == 0, uptime);  
+    generate_svg_response(client_sock, result == 0, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);  
 }
 // HTTP 请求处理
 void handle_http_request(int client_sock)  
