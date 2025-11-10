@@ -42,6 +42,11 @@ N2N supernode 检测工具
 # 采用配置文件并后台运行
 nohup ./n2n_check_http -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
 ```
+- 在openwrt里因为时区问题 可能需要指定时区启动 如 `TZ=utc-8`
+
+```
+TZ=utc-8 ./n2n_check_http -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
+```
 
 #### ② systemd 服务： 
 
