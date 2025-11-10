@@ -756,6 +756,25 @@ static void load_config(const char *config_file)
         }
         strncpy(host, line, sizeof(host) - 1);
 
+		// 检查是否重复  
+        int is_duplicate = 0;  
+        for (int j = 0; j < g_state.host_count; j++)  
+        {  
+            if (strcmp(g_state.hosts[j].host, host) == 0 &&   
+                g_state.hosts[j].port == port)  
+            {  
+                is_duplicate = 1;  
+                fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (第 %d 行): %s:%d\n",   
+                        timestamp(), line_num, host, port);  
+                break;  
+            }  
+        }  
+  
+        if (is_duplicate)  
+        {  
+            continue;  // 跳过这个重复的主机  
+        }
+
         host_stats_t *h = &g_state.hosts[g_state.host_count];
         strncpy(h->host, host, sizeof(h->host) - 1);
         h->port = port;
@@ -2304,6 +2323,26 @@ int main(int argc, char *argv[])
         }
 
         strncpy(host, host_str, sizeof(host) - 1);
+
+		// 【新增】检查是否重复  
+    	int is_duplicate = 0;  
+    	for (int j = 0; j < g_state.host_count; j++)  
+    	{  
+        	if (strcmp(g_state.hosts[j].host, host) == 0 &&   
+            	g_state.hosts[j].port == port)  
+        	{  
+            	is_duplicate = 1;  
+            	fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (命令行参数 %d): %s:%d\n",   
+                    timestamp(), i + 1, host, port);  
+            	break;  
+        	}  
+    	}  
+  
+    	if (is_duplicate)  
+    	{  
+        	free(host_str);  
+        	continue;  // 跳过这个重复的主机  
+    	}
 
         host_stats_t *h = &g_state.hosts[g_state.host_count];
         strncpy(h->host, host_str, sizeof(h->host) - 1);
