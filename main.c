@@ -1122,9 +1122,14 @@ void generate_html(char *buf, size_t bufsize)
                        "    var versionCell = row.cells[2].textContent;\n"  
                        "    var statusCell = row.cells[4].textContent;\n"  
                        "    var showVersion = (versionFilter === 'all');\n"  
-                       "    if (!showVersion) {\n"  // 简化条件,去掉多余的 && versionFilter !== 'all'  
-                       "      var regex = new RegExp('\\\\\\\\b' + versionFilter + '\\\\\\\\b');\n"  // 四个反斜杠  
-                       "      showVersion = regex.test(versionCell);\n"  
+                       "    if (!showVersion) {\n"   
+                       "      var badges = versionCell.split(/\\s+/);\n"  
+                       "      for (var j = 0; j < badges.length; j++) {\n"  
+                       "        if (badges[j] === versionFilter) {\n"  
+                       "          showVersion = true;\n"  
+                       "          break;\n"  
+                       "        }\n"  
+                       "      }\n"  
                        "    }\n"  
                        "    var showStatus = (statusFilter === 'all' || \n"  
                        "                     (statusFilter === 'online' && statusCell.includes('在线')) ||\n"  
