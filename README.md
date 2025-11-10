@@ -65,3 +65,21 @@ sudo systemctl daemon-reload
 sudo systemctl start n2n-monitor  # 启动
 sudo systemctl enable n2n-monitor  # 开机自启
 ```
+
+##### 网页嵌套svg图标 ：
+
+  <img width="208" height="33" alt="image" src="https://github.com/user-attachments/assets/2b38f3ea-63bf-4809-9327-325bd7b232b7" />
+
+- 在html网页中嵌入图片并设置宽度、高度与替代文字（alt），可以通过 HTML 的 <img> 标签实现。语法如下：
+
+```
+<img src="https://example.com/api/?supernode=n2n.example.com:10086" alt="" width="200" height="100">
+
+```
+
+- 自适应大小:
+
+```
+<img src="https://example.com/api/?supernode=n2n.example.com:10086" alt="" style="width:100%; height:auto;">
+
+```
