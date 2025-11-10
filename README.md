@@ -19,14 +19,15 @@ N2N supernode 检测工具
 
   -v              详细模式（显示调试信息）
   -h              显示此帮助信息
+
 配置文件格式:
   host:port|备注
   例如: n2n.example.com:10086|北京电信
 
 命令示例:
-  ./edge2 -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090
-  ./edge2 -v -6 "supernode.example.com:7777|北京电信" "192.168.1.1:10090|自建"
-  ./edge2 -p 8080 -i 2 -f n2n_host.conf
+  ./n2n_check_http -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090
+  ./n2n_check_http -v -6 "supernode.example.com:7777|北京电信" "192.168.1.1:10090|自建"
+  ./n2n_check_http -p 8080 -i 2 -f n2n_host.conf
 ```
 
 - 命令行添加备注需要英文的双引号 `"` 包裹才行，配置文件则无需双引号
