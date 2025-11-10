@@ -26,6 +26,7 @@
 #define MAX_HISTORY 300 // 保存300次检测记录
 #define STATE_DIR "/tmp/n2n_monitor"
 
+static int g_enable_syslog = 1;  // 输出日志到系统日志，默认启用 
 time_t last_manual_refresh = 0;  // 记录上次手动刷新时间  
 int manual_refresh_interval = 1; // 默认1分钟间隔
 static int verbose = 0;
@@ -71,6 +72,39 @@ typedef struct
 } uptime_state_t;
 
 static uptime_state_t g_state = {0};
+
+// syslog 转发线程  
+void *syslog_forwarder_thread(void *arg) {  
+    char buffer[4096];  
+    ssize_t n;  
+      
+    // 打开 syslog  
+    openlog("【N2N-monitor】", LOG_PID | LOG_CONS, LOG_DAEMON);  
+      
+    if (verbose) {  
+        syslog(LOG_INFO, "【N2N-monitor】syslog 日志输出已启动");  
+    }  
+      
+    while (g_syslog_running && (n = read(g_syslog_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {  
+        buffer[n] = '\0';  
+          
+        // 解析日志级别  
+        int priority = LOG_INFO;  
+        if (strstr(buffer, "[ERROR]")) {  
+            priority = LOG_ERR;  
+        } else if (strstr(buffer, "[WARN]")) {  
+            priority = LOG_WARNING;  
+        } else if (strstr(buffer, "[DEBUG]")) {  
+            priority = LOG_DEBUG;  
+        }  
+          
+        // 写入 syslog,添加标题  
+        syslog(priority, "【N2N-monitor】%s", buffer);  
+    }  
+      
+    closelog();  
+    return NULL;  
+}
 
 // 编码函数
 static void encode_uint8(uint8_t *buf, size_t *idx, uint8_t val)
@@ -2336,7 +2370,9 @@ static void print_help(const char *prog_name)
     printf("  -c <社区名>     指定探测使用的社区名称 (默认: N2N_check_bot)\n");
     printf("  -m <MAC地址>    指定探测使用的MAC地址,格式: a1:b2:c3:d4:f5:g6 (默认: a1:b2:c3:d4:f5:06)\n");
     printf("  -4              仅使用 IPv4 (默认)\n");
-    printf("  -6              同时支持 IPv4 和 IPv6\n");
+    printf("  -6              同时支持 IPv4 和 IPv6\n"); 
+    printf("  -s              启用输出到系统日志 (默认启用)\n");  
+    printf("  --no-syslog     禁用输出到系统日志\n");  
     printf("  -v              详细模式（显示调试信息）\n");
     printf("  -h              显示此帮助信息\n\n");
     printf("配置文件格式:\n");
@@ -2376,6 +2412,18 @@ int main(int argc, char *argv[])
             {
                 fprintf(stderr, "[%s] [DEBUG]: 详细模式已启用\n", timestamp());
             }
+        }
+		else if (strcmp(argv[arg_start], "-s") == 0)  
+        {  
+            g_enable_syslog = 1;  
+            arg_start++;  
+            fprintf(stderr, "[%s] [INFO]: 系统日志输出已启用\n", timestamp());  
+        }  
+        else if (strcmp(argv[arg_start], "--no-syslog") == 0)  
+        {  
+            g_enable_syslog = 0;  
+            arg_start++;  
+            fprintf(stderr, "[%s] [INFO]: 系统日志输出已禁用\n", timestamp());  
         }
         else if (strcmp(argv[arg_start], "-p") == 0 && arg_start + 1 < argc)
         {
@@ -2465,6 +2513,56 @@ int main(int argc, char *argv[])
             break;
         }
     }
+
+	// 在初始化状态之前,设置 syslog 重定向  
+    int original_stderr = -1;  
+    if (g_enable_syslog)  
+    {  
+        // 保存原始 stderr  
+        original_stderr = dup(STDERR_FILENO);  
+          
+        // 创建管道用于 stderr 重定向  
+        if (pipe(g_syslog_pipe) == -1)  
+        {  
+            fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 管道: %s\n", timestamp(), strerror(errno));  
+            fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
+            g_enable_syslog = 0;  
+        }  
+        else  
+        {  
+            g_syslog_running = 1;  
+              
+            // 启动 syslog 转发线程  
+            if (pthread_create(&g_syslog_thread, NULL, syslog_forwarder_thread, NULL) != 0)  
+            {  
+                fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 线程: %s\n", timestamp(), strerror(errno));  
+                fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
+                close(g_syslog_pipe[0]);  
+                close(g_syslog_pipe[1]);  
+                g_enable_syslog = 0;  
+                g_syslog_running = 0;  
+            }  
+            else  
+            {  
+                // 重定向 stderr 到管道  
+                if (dup2(g_syslog_pipe[1], STDERR_FILENO) == -1)  
+                {  
+                    fprintf(stderr, "[%s] [ERROR]: 无法重定向 stderr: %s\n", timestamp(), strerror(errno));  
+                    fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
+                    g_syslog_running = 0;  
+                    pthread_cancel(g_syslog_thread);  
+                    close(g_syslog_pipe[0]);  
+                    close(g_syslog_pipe[1]);  
+                    g_enable_syslog = 0;  
+                }  
+                else  
+                {  
+                    close(g_syslog_pipe[1]);  // 关闭写端的原始 fd  
+                    fprintf(stderr, "[%s] [INFO]: 系统日志转发已启动\n", timestamp());  
+                }  
+            }  
+        }  
+    }  
 
     // 初始化状态
     pthread_mutex_init(&g_state.lock, NULL);
