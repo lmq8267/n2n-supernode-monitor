@@ -28,7 +28,6 @@
 #define STATE_DIR "/tmp/n2n_monitor"
 
 static int g_enable_syslog = 1;  // 输出日志到系统日志，默认启用
-static int g_enable_syslog = 1;      // 默认启用  
 static int g_syslog_pipe[2];         // 管道文件描述符  
 static pthread_t g_syslog_thread;    // syslog 转发线程  
 static int g_syslog_running = 0;     // 线程运行标志
