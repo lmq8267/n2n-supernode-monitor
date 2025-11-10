@@ -2398,22 +2398,22 @@ int main(int argc, char *argv[])
 
         if (client_sock >= 0)
         {
-            if (verbose)
-            {
+            // if (verbose)
+            // {
                 char client_ip[INET6_ADDRSTRLEN];
                 if (client_addr.ss_family == AF_INET)
                 {
                     inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
                               client_ip, sizeof(client_ip));
-                    fprintf(stderr, "[%s] [DEBUG]: 客户端 [%s] 访问了主页\n", timestamp(), client_ip);
+                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
                 }
                 else if (client_addr.ss_family == AF_INET6)
                 {
                     inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
                               client_ip, sizeof(client_ip));
-                    fprintf(stderr, "[%s] [DEBUG]: 客户端 [%s] 访问了主页\n", timestamp(), client_ip);
+                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
                 }
-            }
+            // }
             handle_http_request(client_sock);
         }
         else if (errno != EINTR)
