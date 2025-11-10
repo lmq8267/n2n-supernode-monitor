@@ -102,30 +102,33 @@ jobs:
      - name: 编译
        run: |
          make 
-         mkdir -p ${{ matrix.target }}
-         mv n2n_check_cli ${{ matrix.target }}/n2n_check_cli
-         mv n2n_check_http ${{ matrix.target }}/n2n_check_http
+         mkdir -p bin
+         mv n2n_check_cli bin/n2n_check_cli
+         mv n2n_check_http bin/n2n_check_http
        
      - name: 安装 UPX
-       if: github.event.inputs.upx == 'true' 
+       if: ${{ github.event.inputs.upx }} 
        uses: crazy-max/ghaction-upx@v3
        with:
         version: v4.2.4
         install-only: true
         
      - name: 压缩二进制
-       if: github.event.inputs.upx == 'true'
-       run: upx --lzma --best ${{ matrix.target }}/* || true
+       if: ${{ github.event.inputs.upx }}
+       run: upx --lzma --best bin/* || true
+
+     - name: 打包 zip
+       run: zip -j n2n-supernode-monitor_${{ matrix.target }}.zip bin/*
        
      - name: 上传产物
        uses: actions/upload-artifact@v4
        with:
         name: n2n-supernode-monitor-${{ matrix.target }}
-        path: ${{ matrix.target }}/*
+        path: n2n-supernode-monitor_${{ matrix.target }}.zip
 
   release:
     needs: build
-    if: github.event.inputs.rel == 'true'
+    if: ${{ github.event.inputs.rel }}
     runs-on: ubuntu-latest
     steps:
      - name: 下载所有构建产物
@@ -141,14 +144,6 @@ jobs:
               echo "tag=$(date '+%Y-%m-%d')" >> $GITHUB_ENV
           fi
 
-     - name: 打包 zip
-       run: |
-          mkdir -p out
-          find release -type f -exec cp {} out/ \;
-          cd out
-          zip -j ../n2n-supernode-monitor_${{ matrix.target }}.zip *
-          cd ..
-
      - name: 发布 Release
        uses: softprops/action-gh-release@v2
        with:
@@ -157,9 +152,10 @@ jobs:
            > ### ![](https://img.shields.io/badge/%E7%BC%96%E8%AF%91%E6%97%B6%E9%97%B4-${{ env.build_time }}-8267?logo=github&labelColor=%E9%A1%BB)![](https://img.shields.io/github/downloads/${{ github.repository }}/${{ env.tag }}/total?label=%E4%B8%8B%E8%BD%BD%E6%AC%A1%E6%95%B0&logo=github)
           
           tag_name: ${{ env.tag }}
-          files: n2n-supernode-monitor_${{ matrix.target }}.zip
+          files: release/*.zip
 
   del:
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: 删除流程记录
