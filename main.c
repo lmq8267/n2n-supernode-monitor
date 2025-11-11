@@ -396,260 +396,268 @@ static int is_valid_v3_ack(const uint8_t *buf, size_t len, const uint8_t *expect
 }
 
 // 检测单个 supernode (使用单socket非阻塞方式)
-int test_supernode_internal(const char *host, int port, int *v1_ok, int *v2_ok, int *v2s_ok, int *v3_ok)
-{
-    struct sockaddr_in addr;
-    uint8_t pktbuf_v1[2048], pktbuf_v2[2048], pktbuf_v2s[2048], pktbuf_v3[2048];
-    uint8_t recvbuf[2048];
-
-    uint8_t cookie_v2[N2N_COOKIE_SIZE] = {0xA2, 0xB2, 0xC2, 0xD2};
-    uint8_t cookie_v2s[N2N_COOKIE_SIZE] = {0x11, 0x22, 0x33, 0x44};
-    uint8_t cookie_v3[N2N_COOKIE_SIZE] = {0xA3, 0xB3, 0xC3, 0xD3};
-
-    struct addrinfo hints = {0};
-    struct addrinfo *result = NULL;
-
-    *v1_ok = *v2_ok = *v2s_ok = *v3_ok = 0;
-
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-
-    if (getaddrinfo(host, NULL, &hints, &result) != 0)
-    {
-        fprintf(stderr, "[%s] [ERROR]: %s:%d DNS 解析失败: %s\n", timestamp(), host, port, strerror(errno));
-        return -1;
-    }
-
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    addr.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;
-    freeaddrinfo(result);
-
-    if (verbose)
-    {
-        char ip_str[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
-        fprintf(stderr, "[%s] [DEBUG]: %s:%d 解析为 %s:%d\n", timestamp(), host, port, ip_str, port);
-    }
-
-    char community[N2N_COMMUNITY_SIZE];
-    strncpy(community, g_community, N2N_COMMUNITY_SIZE - 1);
-    community[N2N_COMMUNITY_SIZE - 1] = '\0';
-
-    size_t pkt_len_v1 = build_register_v1(pktbuf_v1, community);
-    size_t pkt_len_v2 = build_register_super_v2(pktbuf_v2, community, cookie_v2);
-    size_t pkt_len_v2s = build_register_super_v2s(pktbuf_v2s, community, cookie_v2s);
-    size_t pkt_len_v3 = build_register_super_v3(pktbuf_v3, community, cookie_v3);
-
-    // 只创建一个 socket
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-    {
-        fprintf(stderr, "[%s] [ERROR]: %s:%d - Socket 创建失败: %s\n", timestamp(), host, port, strerror(errno));
-        return -1;
-    }
-
-    // 设置非阻塞模式
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-
-    // 发送所有数据包并记录状态
-    ssize_t sent_v1 = sendto(sock, pktbuf_v1, pkt_len_v1, 0, (struct sockaddr *)&addr, sizeof(addr));
-    ssize_t sent_v2 = sendto(sock, pktbuf_v2, pkt_len_v2, 0, (struct sockaddr *)&addr, sizeof(addr));
-    ssize_t sent_v2s = sendto(sock, pktbuf_v2s, pkt_len_v2s, 0, (struct sockaddr *)&addr, sizeof(addr));
-    ssize_t sent_v3 = sendto(sock, pktbuf_v3, pkt_len_v3, 0, (struct sockaddr *)&addr, sizeof(addr));
-
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: %s:%d 发送数据包:\n", timestamp(), host, port);
-        fprintf(stderr, "[%s] [DEBUG]:   v1:  %s (%zd/%zu 字节)\n",
-                timestamp(), sent_v1 >= 0 ? "成功" : "失败", sent_v1, pkt_len_v1);
-        fprintf(stderr, "[%s] [DEBUG]:   v2:  %s (%zd/%zu 字节)\n",
-                timestamp(), sent_v2 >= 0 ? "成功" : "失败", sent_v2, pkt_len_v2);
-        fprintf(stderr, "[%s] [DEBUG]:   v2s: %s (%zd/%zu 字节)\n",
-                timestamp(), sent_v2s >= 0 ? "成功" : "失败", sent_v2s, pkt_len_v2s);
-        fprintf(stderr, "[%s] [DEBUG]:   v3:  %s (%zd/%zu 字节)\n",
-                timestamp(), sent_v3 >= 0 ? "成功" : "失败", sent_v3, pkt_len_v3);
-    }
-    // 使用 gettimeofday 获得微秒级精度
-    struct timeval start_tv, now_tv;
-    gettimeofday(&start_tv, NULL);
-    long timeout_ms = 800; // 800ms 总超时
-    int responses_received = 0;
-    int consecutive_empty = 0;
-    long last_log_ms = 0;
-
-    while (1)
-    {
-        gettimeofday(&now_tv, NULL);
-        long elapsed_ms = (now_tv.tv_sec - start_tv.tv_sec) * 1000 +
-                          (now_tv.tv_usec - start_tv.tv_usec) / 1000;
-
-        // 每200ms输出一次进度
-        if (verbose && elapsed_ms - last_log_ms >= 200)
-        {
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 等待响应... 已用时 %ldms (收到 %d 个响应)\n",
-                    timestamp(), host, port, elapsed_ms, responses_received);
-            last_log_ms = elapsed_ms;
-        }
-
-        if (elapsed_ms >= timeout_ms)
-        {
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 达到超时时间 %ldms,停止等待\n", timestamp(), host, port, timeout_ms);
-            }
-            break;
-        }
-
-        // 如果已收到所有可能的响应,提前退出
-        if (*v1_ok && *v2_ok && *v2s_ok && *v3_ok)
-        {
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 所有版本响应已收到,提前退出\n", timestamp(), host, port);
-            }
-            break;
-        }
-
-        // 尝试接收数据
-        ssize_t recv_len = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
-
-        if (recv_len < 0)
-        {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-            {
-                // 没有数据可读
-                consecutive_empty++;
-                if (consecutive_empty >= 5 && responses_received > 0)
-                {
-                    // 连续 5 次没数据且已收到至少一个响应,可能不会再有响应了
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 连续 %d 次无数据,提前退出\n",
-                                timestamp(), host, port, consecutive_empty);
-                    }
-                    break;
-                }
-                usleep(20000); // 等待 20ms
-                continue;
-            }
-            else
-            {
-                // 其他错误
-                if (verbose)
-                {
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d recvfrom() 错误: %s\n",
-                            timestamp(), host, port, strerror(errno));
-                }
-                break;
-            }
-        }
-
-        consecutive_empty = 0;
-        responses_received++;
-
-        // 根据响应内容判断版本
-        if (recv_len >= 2 && !*v1_ok)
-        {
-            if (is_valid_v1_ack(recvbuf, recv_len))
-            {
-                *v1_ok = 1;
-                if (verbose)
-                {
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v1 响应：✓ 在线\n", timestamp(), host, port);
-                }
-                continue;
-            }
-            else if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 响应不是有效的 v1 ACK\n", timestamp(), host, port);
-            }
-        }
-
-        if (recv_len >= 28 && !*v2_ok)
-        {
-            if (is_valid_v2_ack(recvbuf, recv_len, cookie_v2))
-            {
-                *v2_ok = 1;
-                if (verbose)
-                {
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2 响应：✓ 在线\n", timestamp(), host, port);
-                }
-                continue;
-            }
-            else if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 响应不是有效的 v2 ACK\n", timestamp(), host, port);
-            }
-        }
-
-        if (recv_len >= 28 && !*v2s_ok)
-        {
-            if (is_valid_v2s_ack(recvbuf, recv_len, cookie_v2s))
-            {
-                *v2s_ok = 1;
-                if (verbose)
-                {
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2s 响应：✓ 在线\n", timestamp(), host, port);
-                }
-                continue;
-            }
-            else if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 响应不是有效的 v2s ACK\n", timestamp(), host, port);
-            }
-        }
-
-        if (recv_len >= 28 && !*v3_ok)
-        {
-            if (is_valid_v3_ack(recvbuf, recv_len, cookie_v3))
-            {
-                *v3_ok = 1;
-                if (verbose)
-                {
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v3 响应：✓ 在线\n", timestamp(), host, port);
-                }
-                continue;
-            }
-            else if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 响应不是有效的 v3 ACK\n", timestamp(), host, port);
-            }
-        }
-    }
-
-    close(sock);
-    // 输出最终检测结果
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测完成 - v1:%s v2:%s v2s:%s v3:%s\n",
-                timestamp(), host, port,
-                *v1_ok ? "✓" : "✗",
-                *v2_ok ? "✓" : "✗",
-                *v2s_ok ? "✓" : "✗",
-                *v3_ok ? "✓" : "✗");
-    }
-    // 如果所有版本都失败,输出诊断信息
-    if (!*v1_ok && !*v2_ok && !*v2s_ok && !*v3_ok)
-    {
-        if (verbose)
-        {
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 未收到任何响应,主机不可达?端口关闭?被过滤?\n",
-                    timestamp(), host, port);
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 诊断信息:\n", timestamp(), host, port);
-            fprintf(stderr, "[%s] [DEBUG]:   - 发送状态: v1=%s v2=%s v2s=%s v3=%s\n",
-                    timestamp(),
-                    sent_v1 >= 0 ? "成功" : "失败",
-                    sent_v2 >= 0 ? "成功" : "失败",
-                    sent_v2s >= 0 ? "成功" : "失败",
-                    sent_v3 >= 0 ? "成功" : "失败");
-            fprintf(stderr, "[%s] [DEBUG]:   - 收到的响应数: %d\n", timestamp(), responses_received);
-            fprintf(stderr, "[%s] [DEBUG]:   - 超时时间: %ldms\n", timestamp(), timeout_ms);
-        }
-    }
-    return (*v1_ok || *v2_ok || *v2s_ok || *v3_ok) ? 0 : -1;
+int test_supernode_internal(const char *host, int port, int *v1_ok, int *v2_ok, int *v2s_ok, int *v3_ok)  
+{  
+    const int MAX_RETRIES = 4;  // 总共尝试 5 次（首次 + 4 次重试）  
+    int retry_attempt = 0;  
+      
+    *v1_ok = *v2_ok = *v2s_ok = *v3_ok = 0;  
+      
+    // 重试循环  
+    while (retry_attempt < MAX_RETRIES) {  
+        if (verbose && retry_attempt > 0) {  
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 第 %d 次重试\n",  
+                    timestamp(), host, port, retry_attempt);  
+        }  
+          
+        // DNS 解析  
+        struct sockaddr_in addr;  
+        struct addrinfo hints = {0};  
+        struct addrinfo *result = NULL;  
+          
+        hints.ai_family = AF_INET;  
+        hints.ai_socktype = SOCK_DGRAM;  
+          
+        if (getaddrinfo(host, NULL, &hints, &result) != 0)  
+        {  
+            fprintf(stderr, "[%s] [ERROR]: %s:%d DNS 解析失败: %s\n", timestamp(), host, port, strerror(errno));  
+            return -1;  
+        }  
+          
+        memset(&addr, 0, sizeof(addr));  
+        addr.sin_family = AF_INET;  
+        addr.sin_port = htons(port);  
+        addr.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;  
+        freeaddrinfo(result);  
+          
+        if (verbose)  
+        {  
+            char ip_str[INET_ADDRSTRLEN];  
+            inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));  
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 解析为 %s:%d\n", timestamp(), host, port, ip_str, port);  
+        }  
+          
+        // 构建数据包  
+        uint8_t pktbuf_v1[2048], pktbuf_v2[2048], pktbuf_v2s[2048], pktbuf_v3[2048];  
+        uint8_t recvbuf[2048];  
+          
+        uint8_t cookie_v2[N2N_COOKIE_SIZE] = {0xA2, 0xB2, 0xC2, 0xD2};  
+        uint8_t cookie_v2s[N2N_COOKIE_SIZE] = {0x11, 0x22, 0x33, 0x44};  
+        uint8_t cookie_v3[N2N_COOKIE_SIZE] = {0xA3, 0xB3, 0xC3, 0xD3};  
+          
+        char community[N2N_COMMUNITY_SIZE];  
+        strncpy(community, g_community, N2N_COMMUNITY_SIZE - 1);  
+        community[N2N_COMMUNITY_SIZE - 1] = '\0';  
+          
+        size_t pkt_len_v1 = build_register_v1(pktbuf_v1, community);  
+        size_t pkt_len_v2 = build_register_super_v2(pktbuf_v2, community, cookie_v2);  
+        size_t pkt_len_v2s = build_register_super_v2s(pktbuf_v2s, community, cookie_v2s);  
+        size_t pkt_len_v3 = build_register_super_v3(pktbuf_v3, community, cookie_v3);  
+          
+        // 创建 socket  
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);  
+        if (sock < 0)  
+        {  
+            fprintf(stderr, "[%s] [ERROR]: %s:%d - Socket 创建失败: %s\n", timestamp(), host, port, strerror(errno));  
+            return -1;  
+        }  
+          
+        // 设置非阻塞模式  
+        int flags = fcntl(sock, F_GETFL, 0);  
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);  
+          
+        // 发送所有数据包  
+        ssize_t sent_v1 = sendto(sock, pktbuf_v1, pkt_len_v1, 0, (struct sockaddr *)&addr, sizeof(addr));  
+        ssize_t sent_v2 = sendto(sock, pktbuf_v2, pkt_len_v2, 0, (struct sockaddr *)&addr, sizeof(addr));  
+        ssize_t sent_v2s = sendto(sock, pktbuf_v2s, pkt_len_v2s, 0, (struct sockaddr *)&addr, sizeof(addr));  
+        ssize_t sent_v3 = sendto(sock, pktbuf_v3, pkt_len_v3, 0, (struct sockaddr *)&addr, sizeof(addr));  
+          
+        if (verbose)  
+        {  
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 发送数据包:\n", timestamp(), host, port);  
+            fprintf(stderr, "[%s] [DEBUG]:   v1:  %s (%zd/%zu 字节)\n",  
+                    timestamp(), sent_v1 >= 0 ? "成功" : "失败", sent_v1, pkt_len_v1);  
+            fprintf(stderr, "[%s] [DEBUG]:   v2:  %s (%zd/%zu 字节)\n",  
+                    timestamp(), sent_v2 >= 0 ? "成功" : "失败", sent_v2, pkt_len_v2);  
+            fprintf(stderr, "[%s] [DEBUG]:   v2s: %s (%zd/%zu 字节)\n",  
+                    timestamp(), sent_v2s >= 0 ? "成功" : "失败", sent_v2s, pkt_len_v2s);  
+            fprintf(stderr, "[%s] [DEBUG]:   v3:  %s (%zd/%zu 字节)\n",  
+                    timestamp(), sent_v3 >= 0 ? "成功" : "失败", sent_v3, pkt_len_v3);  
+        }  
+          
+        // 接收响应  
+        struct timeval start_tv, now_tv;  
+        gettimeofday(&start_tv, NULL);  
+        long timeout_ms = 1000;  
+        int responses_received = 0;  
+        int consecutive_empty = 0;  
+        long last_log_ms = 0;  
+          
+        while (1)  
+        {  
+            gettimeofday(&now_tv, NULL);  
+            long elapsed_ms = (now_tv.tv_sec - start_tv.tv_sec) * 1000 +  
+                              (now_tv.tv_usec - start_tv.tv_usec) / 1000;  
+              
+            if (verbose && elapsed_ms - last_log_ms >= 200)  
+            {  
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 等待响应... 已用时 %ldms (收到 %d 个响应)\n",  
+                        timestamp(), host, port, elapsed_ms, responses_received);  
+                last_log_ms = elapsed_ms;  
+            }  
+              
+            if (elapsed_ms >= timeout_ms)  
+            {  
+                if (verbose)  
+                {  
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 达到超时时间 %ldms 未收到响应,停止等待\n", timestamp(), host, port, timeout_ms);  
+                }  
+                break;  
+            }  
+              
+            if (*v1_ok && *v2_ok && *v2s_ok && *v3_ok)  
+            {  
+                if (verbose)  
+                {  
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 所有版本响应已收到,提前退出\n", timestamp(), host, port);  
+                }  
+                break;  
+            }  
+              
+            ssize_t recv_len = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);  
+              
+            if (recv_len < 0)  
+            {  
+                if (errno == EAGAIN || errno == EWOULDBLOCK)  
+                {  
+                    consecutive_empty++;  
+                    if (consecutive_empty >= 5 && responses_received > 0)  
+                    {  
+                        if (verbose)  
+                        {  
+                            fprintf(stderr, "[%s] [DEBUG]: %s:%d 连续 %d 次无数据,提前退出\n",  
+                                    timestamp(), host, port, consecutive_empty);  
+                        }  
+                        break;  
+                    }  
+                    usleep(20000);  
+                    continue;  
+                }  
+                else  
+                {  
+                    if (verbose)  
+                    {  
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d recvfrom() 错误: %s\n",  
+                                timestamp(), host, port, strerror(errno));  
+                    }  
+                    break;  
+                }  
+            }  
+              
+            consecutive_empty = 0;  
+            responses_received++;  
+              
+            // 验证各版本响应  
+            if (recv_len >= 2 && !*v1_ok)  
+            {  
+                if (is_valid_v1_ack(recvbuf, recv_len))  
+                {  
+                    *v1_ok = 1;  
+                    if (verbose)  
+                    {  
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v1 响应：✓ 在线\n", timestamp(), host, port);  
+                    }  
+                    continue;  
+                }  
+            }  
+              
+            if (recv_len >= 28 && !*v2_ok)  
+            {  
+                if (is_valid_v2_ack(recvbuf, recv_len, cookie_v2))  
+                {  
+                    *v2_ok = 1;  
+                    if (verbose)  
+                    {  
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2 响应：✓ 在线\n", timestamp(), host, port);  
+                    }  
+                    continue;  
+                }  
+            }  
+              
+            if (recv_len >= 28 && !*v2s_ok)  
+            {  
+                if (is_valid_v2s_ack(recvbuf, recv_len, cookie_v2s))  
+                {  
+                    *v2s_ok = 1;  
+                    if (verbose)  
+                    {  
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2s 响应：✓ 在线\n", timestamp(), host, port);  
+                    }  
+                    continue;  
+                }  
+            }  
+              
+            if (recv_len >= 28 && !*v3_ok)  
+            {  
+                if (is_valid_v3_ack(recvbuf, recv_len, cookie_v3))  
+                {  
+                    *v3_ok = 1;  
+                    if (verbose)  
+                    {  
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v3 响应：✓ 在线\n", timestamp(), host, port);  
+                    }  
+                    continue;  
+                }  
+            }  
+        }  
+          
+        close(sock);  
+          
+        // 检查是否有任何版本成功  
+        if (*v1_ok || *v2_ok || *v2s_ok || *v3_ok)  
+        {  
+            // 至少有一个版本成功，立即返回成功  
+            if (verbose)  
+            {  
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测成功（第 %d 次尝试）- v1:%s v2:%s v2s:%s v3:%s\n",  
+                        timestamp(), host, port, retry_attempt + 1,  
+                        *v1_ok ? "✓" : "✗",  
+                        *v2_ok ? "✓" : "✗",  
+                        *v2s_ok ? "✓" : "✗",  
+                        *v3_ok ? "✓" : "✗");  
+            }  
+            return 0;  
+        }  
+          
+        // 所有版本都失败  
+        retry_attempt++;  
+          
+        if (retry_attempt < MAX_RETRIES)  
+        {  
+            // 还有重试机会，等待 500ms 后重试  
+            if (verbose)  
+            {  
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测失败，等待 500ms 后重试（剩余 %d 次机会）\n",  
+                        timestamp(), host, port, MAX_RETRIES - retry_attempt);  
+            }  
+            usleep(500000);  // 等待 500ms  
+        }  
+    }  
+      
+    // 所有重试都失败  
+    if (verbose)  
+    {  
+        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测完成（已重试 %d 次）- v1:%s v2:%s v2s:%s v3:%s\n",  
+                timestamp(), host, port, MAX_RETRIES,  
+                *v1_ok ? "✓" : "✗",  
+                *v2_ok ? "✓" : "✗",  
+                *v2s_ok ? "✓" : "✗",  
+                *v3_ok ? "✓" : "✗");  
+        fprintf(stderr, "[%s] [DEBUG]: %s:%d 未收到任何响应,主机不可达?端口关闭?被过滤?\n",  
+                timestamp(), host, port);  
+    }  
+      
+    return -1;  
 }
 
 // 加载历史记录
