@@ -13,8 +13,11 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <dirent.h>
-#include <syslog.h> 
+#include <syslog.h>
+#include <resolv.h>
+#include <arpa/nameser.h>
 #include <signal.h>
+#include <ctype.h>
 
 #define N2N_COMMUNITY_SIZE 20
 #define N2N_MAC_SIZE 6
@@ -25,18 +28,21 @@
 #define MSG_TYPE_REGISTER 1
 #define MSG_TYPE_REGISTER_ACK 4
 #define MAX_HOSTS 100
-#define MAX_HISTORY 300 // 保存300次检测记录
-#define STATE_DIR "/tmp/n2n_monitor"
 
-static int g_enable_syslog = 1;  // 输出日志到系统日志，默认启用
-static int g_syslog_pipe[2];         // 管道文件描述符  
-static pthread_t g_syslog_thread;    // syslog 转发线程  
-static int g_syslog_running = 0;     // 线程运行标志
-time_t last_manual_refresh = 0;  // 记录上次手动刷新时间  
-int manual_refresh_interval = 1; // 默认1分钟间隔
+static int g_enable_syslog = 1;   // 输出日志到系统日志，默认启用
+static int g_syslog_pipe[2];      // 管道文件描述符
+static pthread_t g_syslog_thread; // syslog 转发线程
+static int g_syslog_running = 0;  // 线程运行标志
+time_t last_manual_refresh = 0;   // 记录上次手动刷新时间
+int manual_refresh_interval = 1;  // 默认1分钟检测间隔
+static long g_timeout_ms = 1000;  // 默认 1000ms (1秒)未响应判定为离线
+static int g_max_retries = 5;  // 默认5次 检测重试次数
+static int g_max_history = 300;  // 默认300条 保存的最大历史检测记录  
+static char g_state_dir[1024] = "/tmp/n2n_monitor";  // 默认历史检测记录保存路径 
 static int verbose = 0;
 static char g_community[N2N_COMMUNITY_SIZE] = "N2N_check_bot";
 static uint8_t g_mac[N2N_MAC_SIZE] = {0xa1, 0xb2, 0xc3, 0xd4, 0xf5, 0x06}; // a1:b2:c3:d4:f5:06
+static volatile sig_atomic_t g_shutdown_requested = 0;
 
 // 单次检测记录
 typedef struct
@@ -48,10 +54,10 @@ typedef struct
 // 统计数据结构
 typedef struct
 {
-    char host[256];  // 实际主机名/IP
+    char host[256]; // 实际主机名/IP
     int port;
-    char note[2048]; // 备注
-    char display_name[256];      // 新增:前端显示主机名
+    char note[2048];        // 备注
+    char display_name[256]; // 前端显示主机名
     int total_checks;
     int success_v1;
     int success_v2;
@@ -59,9 +65,10 @@ typedef struct
     int success_v3;
     time_t last_check;
     char last_status[64];
-    check_record_t history[MAX_HISTORY]; // 循环历史记录
+    check_record_t *history; // 循环历史记录
     int history_index;                   // 当前写入位置
     int history_count;                   // 已有记录数
+    int max_history;  // 记录该主机的最大历史数
 } host_stats_t;
 
 typedef struct
@@ -72,43 +79,66 @@ typedef struct
     int check_interval_minutes;
     time_t start_time;
     int running;
-	char config_file_path[1024];  // :配置文件路径  
-    time_t config_mtime;         // 配置文件最后修改时间 
+    char config_file_path[1024]; // :配置文件路径
+    time_t config_mtime;         // 配置文件最后修改时间
 } uptime_state_t;
 
 static uptime_state_t g_state = {0};
 
-// syslog 转发线程  
-void *syslog_forwarder_thread(void *arg) {  
-    char buffer[4096];  
-    ssize_t n;  
-      
-    // 打开 syslog  
-    openlog("【N2N-monitor】", LOG_PID | LOG_CONS, LOG_DAEMON);  
-      
-    if (verbose) {  
-        syslog(LOG_INFO, "syslog 日志输出已启动");  
-    }  
-      
-    while (g_syslog_running && (n = read(g_syslog_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {  
-        buffer[n] = '\0';  
-          
-        // 解析日志级别  
-        int priority = LOG_INFO;  
-        if (strstr(buffer, "[ERROR]")) {  
-            priority = LOG_ERR;  
-        } else if (strstr(buffer, "[WARN]")) {  
-            priority = LOG_WARNING;  
-        } else if (strstr(buffer, "[DEBUG]")) {  
-            priority = LOG_DEBUG;  
-        }  
-          
-        // 写入 syslog 系统日志
-        syslog(priority, "%s", buffer);  
-    }  
-      
-    closelog();  
-    return NULL;  
+// syslog 转发线程
+void *syslog_forwarder_thread(void *arg)
+{
+    (void)arg;
+    char buffer[4096];
+    ssize_t n;
+    int original_stderr = *(int *)arg; // 接收原始 stderr
+
+    openlog("【N2N-monitor】", LOG_PID | LOG_CONS, LOG_DAEMON);
+
+    if (verbose)
+    {
+        syslog(LOG_INFO, "syslog 日志输出已启动");
+    }
+
+    while (g_syslog_running && (n = read(g_syslog_pipe[0], buffer, sizeof(buffer) - 1)) > 0)
+    {
+        buffer[n] = '\0';
+
+        // 解析日志级别
+        int priority = LOG_INFO;
+        if (strstr(buffer, "[ERROR]"))
+        {
+            priority = LOG_ERR;
+        }
+        else if (strstr(buffer, "[WARN]"))
+        {
+            priority = LOG_WARNING;
+        }
+        else if (strstr(buffer, "[DEBUG]"))
+        {
+            priority = LOG_DEBUG;
+        }
+
+        // 写入 syslog
+        syslog(priority, "%s", buffer);
+
+        // 同时输出到原始控制台
+        if (original_stderr >= 0)
+        {
+            ssize_t written = write(original_stderr, buffer, n);
+            if (written < 0 && verbose)
+            {
+                syslog(LOG_WARNING, "日志同步输出到控制台失败: %s", strerror(errno));
+            }
+        }
+    }
+
+    closelog();
+    if (original_stderr >= 0)
+    {
+        close(original_stderr);
+    }
+    return NULL;
 }
 
 // 编码函数
@@ -151,7 +181,20 @@ static void encode_common(uint8_t *buf, size_t *idx, uint8_t version, uint8_t tt
     free(comm);
 }
 
-// 解析MAC地址字符串 (格式: a1:b2:c3:d4:f5:g6)
+// 去掉字符串末尾的空白字符（空格、制表符、换行符、回车）
+void trim_right(char *str)
+{
+    if (!str)
+        return;
+    size_t len = strlen(str);
+    while (len > 0 && isspace((unsigned char)str[len - 1]))
+    {
+        str[len - 1] = '\0';
+        len--;
+    }
+}
+
+// 解析MAC地址字符串 (格式: a1:b2:c3:d4:f5:06)
 static int parse_mac(const char *mac_str, uint8_t *mac)
 {
     int values[N2N_MAC_SIZE];
@@ -396,275 +439,291 @@ static int is_valid_v3_ack(const uint8_t *buf, size_t len, const uint8_t *expect
 }
 
 // 检测单个 supernode (使用单socket非阻塞方式)
-int test_supernode_internal(const char *host, int port, int *v1_ok, int *v2_ok, int *v2s_ok, int *v3_ok)  
-{  
-    const int MAX_RETRIES = 4;  // 总共尝试 5 次（首次 + 4 次重试）  
-    int retry_attempt = 0;  
-      
-    *v1_ok = *v2_ok = *v2s_ok = *v3_ok = 0;  
-      
-    // 重试循环  
-    while (retry_attempt < MAX_RETRIES) {  
-        if (verbose && retry_attempt > 0) {  
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 第 %d 次重试\n",  
-                    timestamp(), host, port, retry_attempt);  
-        }  
-          
-        // DNS 解析  
-        struct sockaddr_in addr;  
-        struct addrinfo hints = {0};  
-        struct addrinfo *result = NULL;  
-          
-        hints.ai_family = AF_INET;  
-        hints.ai_socktype = SOCK_DGRAM;  
-          
-        if (getaddrinfo(host, NULL, &hints, &result) != 0)  
-        {  
-            fprintf(stderr, "[%s] [ERROR]: %s:%d DNS 解析失败: %s\n", timestamp(), host, port, strerror(errno));  
-            return -1;  
-        }  
-          
-        memset(&addr, 0, sizeof(addr));  
-        addr.sin_family = AF_INET;  
-        addr.sin_port = htons(port);  
-        addr.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;  
-        freeaddrinfo(result);  
-          
-        if (verbose)  
-        {  
-            char ip_str[INET_ADDRSTRLEN];  
-            inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));  
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 解析为 %s:%d\n", timestamp(), host, port, ip_str, port);  
-        }  
-          
-        // 构建数据包  
-        uint8_t pktbuf_v1[2048], pktbuf_v2[2048], pktbuf_v2s[2048], pktbuf_v3[2048];  
-        uint8_t recvbuf[2048];  
-          
-        uint8_t cookie_v2[N2N_COOKIE_SIZE] = {0xA2, 0xB2, 0xC2, 0xD2};  
-        uint8_t cookie_v2s[N2N_COOKIE_SIZE] = {0x11, 0x22, 0x33, 0x44};  
-        uint8_t cookie_v3[N2N_COOKIE_SIZE] = {0xA3, 0xB3, 0xC3, 0xD3};  
-          
-        char community[N2N_COMMUNITY_SIZE];  
-        strncpy(community, g_community, N2N_COMMUNITY_SIZE - 1);  
-        community[N2N_COMMUNITY_SIZE - 1] = '\0';  
-          
-        size_t pkt_len_v1 = build_register_v1(pktbuf_v1, community);  
-        size_t pkt_len_v2 = build_register_super_v2(pktbuf_v2, community, cookie_v2);  
-        size_t pkt_len_v2s = build_register_super_v2s(pktbuf_v2s, community, cookie_v2s);  
-        size_t pkt_len_v3 = build_register_super_v3(pktbuf_v3, community, cookie_v3);  
-          
-        // 创建 socket  
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);  
-        if (sock < 0)  
-        {  
-            fprintf(stderr, "[%s] [ERROR]: %s:%d - Socket 创建失败: %s\n", timestamp(), host, port, strerror(errno));  
-            return -1;  
-        }  
-          
-        // 设置非阻塞模式  
-        int flags = fcntl(sock, F_GETFL, 0);  
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);  
-          
-        // 发送所有数据包  
-        ssize_t sent_v1 = sendto(sock, pktbuf_v1, pkt_len_v1, 0, (struct sockaddr *)&addr, sizeof(addr));  
-        ssize_t sent_v2 = sendto(sock, pktbuf_v2, pkt_len_v2, 0, (struct sockaddr *)&addr, sizeof(addr));  
-        ssize_t sent_v2s = sendto(sock, pktbuf_v2s, pkt_len_v2s, 0, (struct sockaddr *)&addr, sizeof(addr));  
-        ssize_t sent_v3 = sendto(sock, pktbuf_v3, pkt_len_v3, 0, (struct sockaddr *)&addr, sizeof(addr));  
-          
-        if (verbose)  
-        {  
-            fprintf(stderr, "[%s] [DEBUG]: %s:%d 发送数据包:\n", timestamp(), host, port);  
-            fprintf(stderr, "[%s] [DEBUG]:   v1:  %s (%zd/%zu 字节)\n",  
-                    timestamp(), sent_v1 >= 0 ? "成功" : "失败", sent_v1, pkt_len_v1);  
-            fprintf(stderr, "[%s] [DEBUG]:   v2:  %s (%zd/%zu 字节)\n",  
-                    timestamp(), sent_v2 >= 0 ? "成功" : "失败", sent_v2, pkt_len_v2);  
-            fprintf(stderr, "[%s] [DEBUG]:   v2s: %s (%zd/%zu 字节)\n",  
-                    timestamp(), sent_v2s >= 0 ? "成功" : "失败", sent_v2s, pkt_len_v2s);  
-            fprintf(stderr, "[%s] [DEBUG]:   v3:  %s (%zd/%zu 字节)\n",  
-                    timestamp(), sent_v3 >= 0 ? "成功" : "失败", sent_v3, pkt_len_v3);  
-        }  
-          
-        // 接收响应  
-        struct timeval start_tv, now_tv;  
-        gettimeofday(&start_tv, NULL);  
-        long timeout_ms = 1000;  
-        int responses_received = 0;  
-        int consecutive_empty = 0;  
-        long last_log_ms = 0;  
-          
-        while (1)  
-        {  
-            gettimeofday(&now_tv, NULL);  
-            long elapsed_ms = (now_tv.tv_sec - start_tv.tv_sec) * 1000 +  
-                              (now_tv.tv_usec - start_tv.tv_usec) / 1000;  
-              
-            if (verbose && elapsed_ms - last_log_ms >= 200)  
-            {  
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 等待响应... 已用时 %ldms (收到 %d 个响应)\n",  
-                        timestamp(), host, port, elapsed_ms, responses_received);  
-                last_log_ms = elapsed_ms;  
-            }  
-              
-            if (elapsed_ms >= timeout_ms)  
-            {  
-                if (verbose)  
-                {  
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 达到超时时间 %ldms 未收到响应,停止等待\n", timestamp(), host, port, timeout_ms);  
-                }  
-                break;  
-            }  
-              
-            if (*v1_ok && *v2_ok && *v2s_ok && *v3_ok)  
-            {  
-                if (verbose)  
-                {  
-                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 所有版本响应已收到,提前退出\n", timestamp(), host, port);  
-                }  
-                break;  
-            }  
-              
-            ssize_t recv_len = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);  
-              
-            if (recv_len < 0)  
-            {  
-                if (errno == EAGAIN || errno == EWOULDBLOCK)  
-                {  
-                    consecutive_empty++;  
-                    if (consecutive_empty >= 5 && responses_received > 0)  
-                    {  
-                        if (verbose)  
-                        {  
-                            fprintf(stderr, "[%s] [DEBUG]: %s:%d 连续 %d 次无数据,提前退出\n",  
-                                    timestamp(), host, port, consecutive_empty);  
-                        }  
-                        break;  
-                    }  
-                    usleep(20000);  
-                    continue;  
-                }  
-                else  
-                {  
-                    if (verbose)  
-                    {  
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d recvfrom() 错误: %s\n",  
-                                timestamp(), host, port, strerror(errno));  
-                    }  
-                    break;  
-                }  
-            }  
-              
-            consecutive_empty = 0;  
-            responses_received++;  
-              
-            // 验证各版本响应  
-            if (recv_len >= 2 && !*v1_ok)  
-            {  
-                if (is_valid_v1_ack(recvbuf, recv_len))  
-                {  
-                    *v1_ok = 1;  
-                    if (verbose)  
-                    {  
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v1 响应：✓ 在线\n", timestamp(), host, port);  
-                    }  
-                    continue;  
-                }  
-            }  
-              
-            if (recv_len >= 28 && !*v2_ok)  
-            {  
-                if (is_valid_v2_ack(recvbuf, recv_len, cookie_v2))  
-                {  
-                    *v2_ok = 1;  
-                    if (verbose)  
-                    {  
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2 响应：✓ 在线\n", timestamp(), host, port);  
-                    }  
-                    continue;  
-                }  
-            }  
-              
-            if (recv_len >= 28 && !*v2s_ok)  
-            {  
-                if (is_valid_v2s_ack(recvbuf, recv_len, cookie_v2s))  
-                {  
-                    *v2s_ok = 1;  
-                    if (verbose)  
-                    {  
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2s 响应：✓ 在线\n", timestamp(), host, port);  
-                    }  
-                    continue;  
-                }  
-            }  
-              
-            if (recv_len >= 28 && !*v3_ok)  
-            {  
-                if (is_valid_v3_ack(recvbuf, recv_len, cookie_v3))  
-                {  
-                    *v3_ok = 1;  
-                    if (verbose)  
-                    {  
-                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v3 响应：✓ 在线\n", timestamp(), host, port);  
-                    }  
-                    continue;  
-                }  
-            }  
-        }  
-          
-        close(sock);  
-          
-        // 检查是否有任何版本成功  
-        if (*v1_ok || *v2_ok || *v2s_ok || *v3_ok)  
-        {  
-            // 至少有一个版本成功，立即返回成功  
-            if (verbose)  
-            {  
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测成功（第 %d 次尝试）- v1:%s v2:%s v2s:%s v3:%s\n",  
-                        timestamp(), host, port, retry_attempt + 1,  
-                        *v1_ok ? "✓" : "✗",  
-                        *v2_ok ? "✓" : "✗",  
-                        *v2s_ok ? "✓" : "✗",  
-                        *v3_ok ? "✓" : "✗");  
-            }  
-            return 0;  
-        }  
-          
-        // 所有版本都失败  
-        retry_attempt++;  
-          
-        if (retry_attempt < MAX_RETRIES)  
-        {  
-            // 还有重试机会，等待 500ms 后重试  
-            if (verbose)  
-            {  
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测失败，等待 500ms 后重试（剩余 %d 次机会）\n",  
-                        timestamp(), host, port, MAX_RETRIES - retry_attempt);  
-            }  
-            usleep(500000);  // 等待 500ms  
-        }  
-    }  
-      
-    // 所有重试都失败  
-    if (verbose)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测完成（已重试 %d 次）- v1:%s v2:%s v2s:%s v3:%s\n",  
-                timestamp(), host, port, MAX_RETRIES,  
-                *v1_ok ? "✓" : "✗",  
-                *v2_ok ? "✓" : "✗",  
-                *v2s_ok ? "✓" : "✗",  
-                *v3_ok ? "✓" : "✗");  
-        fprintf(stderr, "[%s] [DEBUG]: %s:%d 未收到任何响应,主机不可达?端口关闭?被过滤?\n",  
-                timestamp(), host, port);  
-    }  
-      
-    return -1;  
+int test_supernode_internal(const char *host, int port, int *v1_ok, int *v2_ok, int *v2s_ok, int *v3_ok)
+{
+    const int MAX_RETRIES = g_max_retries - 1;  // 本次也算一次，所以减1
+    int retry_attempt = 0;
+
+    *v1_ok = *v2_ok = *v2s_ok = *v3_ok = 0;
+
+    // 重试循环
+    while (retry_attempt < MAX_RETRIES)
+    {
+        if (verbose && retry_attempt > 0)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 第 %d 次重试\n",
+                    timestamp(), host, port, retry_attempt);
+        }
+
+        // DNS 解析
+        struct sockaddr_in addr;
+        struct addrinfo hints = {0};
+        struct addrinfo *result = NULL;
+
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_DGRAM;
+
+        if (getaddrinfo(host, NULL, &hints, &result) != 0)
+        {
+            fprintf(stderr, "[%s] [ERROR]: %s:%d DNS 解析失败: %s\n", timestamp(), host, port, strerror(errno));
+            return -1;
+        }
+
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(port);
+        addr.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;
+        freeaddrinfo(result);
+
+        if (verbose)
+        {
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &addr.sin_addr, ip_str, sizeof(ip_str));
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 解析为 %s:%d\n", timestamp(), host, port, ip_str, port);
+        }
+
+        // 构建数据包
+        uint8_t pktbuf_v1[2048], pktbuf_v2[2048], pktbuf_v2s[2048], pktbuf_v3[2048];
+        uint8_t recvbuf[2048];
+
+        uint8_t cookie_v2[N2N_COOKIE_SIZE] = {0xA2, 0xB2, 0xC2, 0xD2};
+        uint8_t cookie_v2s[N2N_COOKIE_SIZE] = {0x11, 0x22, 0x33, 0x44};
+        uint8_t cookie_v3[N2N_COOKIE_SIZE] = {0xA3, 0xB3, 0xC3, 0xD3};
+
+        char community[N2N_COMMUNITY_SIZE];
+        strncpy(community, g_community, N2N_COMMUNITY_SIZE - 1);
+        community[N2N_COMMUNITY_SIZE - 1] = '\0';
+
+        size_t pkt_len_v1 = build_register_v1(pktbuf_v1, community);
+        size_t pkt_len_v2 = build_register_super_v2(pktbuf_v2, community, cookie_v2);
+        size_t pkt_len_v2s = build_register_super_v2s(pktbuf_v2s, community, cookie_v2s);
+        size_t pkt_len_v3 = build_register_super_v3(pktbuf_v3, community, cookie_v3);
+
+        // 创建 socket
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+        {
+            fprintf(stderr, "[%s] [ERROR]: %s:%d - Socket 创建失败: %s\n", timestamp(), host, port, strerror(errno));
+            return -1;
+        }
+
+        // 设置非阻塞模式
+        int flags = fcntl(sock, F_GETFL, 0);
+        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+
+        // 发送所有数据包
+        ssize_t sent_v1 = sendto(sock, pktbuf_v1, pkt_len_v1, 0, (struct sockaddr *)&addr, sizeof(addr));
+        ssize_t sent_v2 = sendto(sock, pktbuf_v2, pkt_len_v2, 0, (struct sockaddr *)&addr, sizeof(addr));
+        ssize_t sent_v2s = sendto(sock, pktbuf_v2s, pkt_len_v2s, 0, (struct sockaddr *)&addr, sizeof(addr));
+        ssize_t sent_v3 = sendto(sock, pktbuf_v3, pkt_len_v3, 0, (struct sockaddr *)&addr, sizeof(addr));
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: %s:%d 发送数据包:\n", timestamp(), host, port);
+            fprintf(stderr, "[%s] [DEBUG]:   v1:  %s (%zd/%zu 字节)\n",
+                    timestamp(), sent_v1 >= 0 ? "成功" : "失败", sent_v1, pkt_len_v1);
+            fprintf(stderr, "[%s] [DEBUG]:   v2:  %s (%zd/%zu 字节)\n",
+                    timestamp(), sent_v2 >= 0 ? "成功" : "失败", sent_v2, pkt_len_v2);
+            fprintf(stderr, "[%s] [DEBUG]:   v2s: %s (%zd/%zu 字节)\n",
+                    timestamp(), sent_v2s >= 0 ? "成功" : "失败", sent_v2s, pkt_len_v2s);
+            fprintf(stderr, "[%s] [DEBUG]:   v3:  %s (%zd/%zu 字节)\n",
+                    timestamp(), sent_v3 >= 0 ? "成功" : "失败", sent_v3, pkt_len_v3);
+        }
+
+        // 接收响应
+        struct timeval start_tv, now_tv;
+        gettimeofday(&start_tv, NULL);
+        long timeout_ms = g_timeout_ms;
+        int responses_received = 0;
+        int consecutive_empty = 0;
+        long last_log_ms = 0;
+
+        while (1)
+        {
+            gettimeofday(&now_tv, NULL);
+            long elapsed_ms = (now_tv.tv_sec - start_tv.tv_sec) * 1000 +
+                              (now_tv.tv_usec - start_tv.tv_usec) / 1000;
+
+            if (verbose && elapsed_ms - last_log_ms >= 200)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 等待响应... 已用时 %ldms (收到 %d 个响应)\n",
+                        timestamp(), host, port, elapsed_ms, responses_received);
+                last_log_ms = elapsed_ms;
+            }
+
+            if (elapsed_ms >= timeout_ms)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 达到超时时间 %ldms 未收到响应,停止等待\n", timestamp(), host, port, timeout_ms);
+                }
+                break;
+            }
+
+            if (*v1_ok && *v2_ok && *v2s_ok && *v3_ok)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 所有版本响应已收到,提前退出\n", timestamp(), host, port);
+                }
+                break;
+            }
+
+            ssize_t recv_len = recvfrom(sock, recvbuf, sizeof(recvbuf), 0, NULL, NULL);
+
+            if (recv_len < 0)
+            {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    consecutive_empty++;
+                    if (consecutive_empty >= 5 && responses_received > 0)
+                    {
+                        if (verbose)
+                        {
+                            fprintf(stderr, "[%s] [DEBUG]: %s:%d 连续 %d 次无数据,提前退出\n",
+                                    timestamp(), host, port, consecutive_empty);
+                        }
+                        break;
+                    }
+                    usleep(20000);
+                    continue;
+                }
+                else
+                {
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d recvfrom() 错误: %s\n",
+                                timestamp(), host, port, strerror(errno));
+                    }
+                    break;
+                }
+            }
+
+            consecutive_empty = 0;
+            responses_received++;
+
+            // 验证各版本响应
+            if (recv_len >= 2 && !*v1_ok)
+            {
+                if (is_valid_v1_ack(recvbuf, recv_len))
+                {
+                    *v1_ok = 1;
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v1 响应：✓ 在线\n", timestamp(), host, port);
+                    }
+                    continue;
+                }
+            }
+
+            if (recv_len >= 28 && !*v2_ok)
+            {
+                if (is_valid_v2_ack(recvbuf, recv_len, cookie_v2))
+                {
+                    *v2_ok = 1;
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2 响应：✓ 在线\n", timestamp(), host, port);
+                    }
+                    continue;
+                }
+            }
+
+            if (recv_len >= 28 && !*v2s_ok)
+            {
+                if (is_valid_v2s_ack(recvbuf, recv_len, cookie_v2s))
+                {
+                    *v2s_ok = 1;
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v2s 响应：✓ 在线\n", timestamp(), host, port);
+                    }
+                    continue;
+                }
+            }
+
+            if (recv_len >= 28 && !*v3_ok)
+            {
+                if (is_valid_v3_ack(recvbuf, recv_len, cookie_v3))
+                {
+                    *v3_ok = 1;
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测到 v3 响应：✓ 在线\n", timestamp(), host, port);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        close(sock);
+
+        // 检查是否有任何版本成功
+        if (*v1_ok || *v2_ok || *v2s_ok || *v3_ok)
+        {
+            // 至少有一个版本成功，立即返回成功
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测成功（第 %d 次尝试）- v1:%s v2:%s v2s:%s v3:%s\n",
+                        timestamp(), host, port, retry_attempt + 1,
+                        *v1_ok ? "✓" : "✗",
+                        *v2_ok ? "✓" : "✗",
+                        *v2s_ok ? "✓" : "✗",
+                        *v3_ok ? "✓" : "✗");
+            }
+            return 0;
+        }
+
+        // 所有版本都失败
+        retry_attempt++;
+
+        if (retry_attempt < MAX_RETRIES)
+        {
+            // 还有重试机会，等待 500ms 后重试
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测失败，等待 500ms 后重试（剩余 %d 次机会）\n",
+                        timestamp(), host, port, MAX_RETRIES - retry_attempt);
+            }
+            usleep(500000); // 等待 500ms
+        }
+    }
+
+    // 所有重试都失败
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测完成（已重试 %d 次）- v1:%s v2:%s v2s:%s v3:%s\n",
+                timestamp(), host, port, MAX_RETRIES,
+                *v1_ok ? "✓" : "✗",
+                *v2_ok ? "✓" : "✗",
+                *v2s_ok ? "✓" : "✗",
+                *v3_ok ? "✓" : "✗");
+        fprintf(stderr, "[%s] [DEBUG]: %s:%d 未收到任何响应,主机不可达?端口关闭?被过滤?\n",
+                timestamp(), host, port);
+    }
+
+    return -1;
 }
 
 // 加载历史记录
 static void load_history(host_stats_t *host)
 {
-    char filename[512];
-    snprintf(filename, sizeof(filename), "%s/%s_%d.dat", STATE_DIR, host->host, host->port);
+    // 【修复】创建安全的文件名(替换特殊字符)
+    char safe_host[512];
+    strncpy(safe_host, host->host, sizeof(safe_host) - 1);
+    safe_host[sizeof(safe_host) - 1] = '\0';
+
+    // 将 / 和 : 替换为 .
+    for (char *p = safe_host; *p; p++)
+    {
+        if (*p == '/' || *p == ':')
+        {
+            *p = '.';
+        }
+    }
+
+    char filename[2048];
+    snprintf(filename, sizeof(filename), "%s/%s_%d.dat", g_state_dir, safe_host, host->port);
 
     FILE *f = fopen(filename, "rb");
     if (!f)
@@ -677,14 +736,50 @@ static void load_history(host_stats_t *host)
         return;
     }
 
-    fread(&host->history_index, sizeof(int), 1, f);
-    fread(&host->history_count, sizeof(int), 1, f);
-    fread(host->history, sizeof(check_record_t), MAX_HISTORY, f);
-    fread(&host->total_checks, sizeof(int), 1, f);
-    fread(&host->success_v1, sizeof(int), 1, f);
-    fread(&host->success_v2, sizeof(int), 1, f);
-    fread(&host->success_v2s, sizeof(int), 1, f);
-    fread(&host->success_v3, sizeof(int), 1, f);
+    // 【修复】添加边界检查
+    size_t read_count;
+
+    read_count = fread(&host->history_index, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    read_count = fread(&host->history_count, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    // 验证数据完整性
+    if (host->history_index < 0 || host->history_index >= host->max_history ||
+        host->history_count < 0 || host->history_count > host->max_history)
+    {
+        fprintf(stderr, "[%s] [ERROR]: %s:%d 历史记录数据损坏\n",
+                timestamp(), host->host, host->port);
+        fclose(f);
+        return;
+    }
+
+    read_count = fread(host->history, sizeof(check_record_t), host->max_history, f);
+    if ((int)read_count != host->max_history)
+        goto read_error;
+
+    read_count = fread(&host->total_checks, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    read_count = fread(&host->success_v1, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    read_count = fread(&host->success_v2, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    read_count = fread(&host->success_v2s, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
+
+    read_count = fread(&host->success_v3, sizeof(int), 1, f);
+    if (read_count != 1)
+        goto read_error;
 
     fclose(f);
     if (verbose)
@@ -695,6 +790,12 @@ static void load_history(host_stats_t *host)
                 timestamp(), host->host, host->port,
                 host->success_v1, host->success_v2, host->success_v2s, host->success_v3);
     }
+    return;
+
+read_error:
+    fprintf(stderr, "[%s] [ERROR]: %s:%d 读取历史记录文件失败\n",
+            timestamp(), host->host, host->port);
+    fclose(f);
 }
 
 // 添加检测记录
@@ -708,8 +809,8 @@ static void add_check_record(host_stats_t *host, int success)
     host->history[host->history_index].timestamp = time(NULL);
     host->history[host->history_index].success = success;
 
-    host->history_index = (host->history_index + 1) % MAX_HISTORY;
-    if (host->history_count < MAX_HISTORY)
+    host->history_index = (host->history_index + 1) % host->max_history;
+    if (host->history_count < host->max_history)
     {
         host->history_count++;
     }
@@ -754,141 +855,281 @@ static float calculate_uptime(const host_stats_t *host)
 }
 
 // 读取配置文件
-static void load_config(const char *config_file)  
-{  
-    if (verbose)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: 开始读取配置文件: %s\n", timestamp(), config_file);  
-    }  
-    FILE *f = fopen(config_file, "r");  
-    if (!f)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: 配置文件打开失败: %s\n", timestamp(), config_file);  
-        return;  
-    }  
-  
-    char line[1024];  
-    int line_num = 0;  
-    while (fgets(line, sizeof(line), f) && g_state.host_count < MAX_HOSTS)  
-    {  
-        line_num++;  
-          
-        // 去除行首空格    
-        char *trimmed_line = line;    
-        while (*trimmed_line == ' ' || *trimmed_line == '\t') {    
-            trimmed_line++;    
-        }  
-          
-        // 跳过注释和空行 - 使用 trimmed_line  
-        if (trimmed_line[0] == '#' || trimmed_line[0] == '\n')  
-        {  
-            if (verbose)  
-            {  
-                fprintf(stderr, "[%s] [DEBUG]: 跳过第 %d 行 (注释或空行)\n", timestamp(), line_num);  
-            }  
-            continue;  
-        }  
-  
-        char host[256] = {0};  
-        int port = 10086;  
-        char note[512] = {0};  
-        char display_name[256] = {0};  
-  
-        // 格式: host:port|备注|前端显示主机名  
-        char *first_pipe = strchr(trimmed_line, '|');    
-        if (first_pipe)    
-        {    
-            *first_pipe = '\0';    
-            char *second_pipe = strchr(first_pipe + 1, '|');    
-            if (second_pipe)    
-            {    
-                *second_pipe = '\0';    
-                strncpy(note, first_pipe + 1, sizeof(note) - 1);    
-                strncpy(display_name, second_pipe + 1, sizeof(display_name) - 1);    
-                char *newline = strchr(display_name, '\n');    
-                if (newline)    
-                    *newline = '\0';    
-            }    
-            else    
-            {    
-                strncpy(note, first_pipe + 1, sizeof(note) - 1);    
-                char *newline = strchr(note, '\n');    
-                if (newline)    
-                    *newline = '\0';    
-            }    
-        }  
-  
-        // 解析端口  
-        char *colon = strchr(trimmed_line, ':');  
-        if (colon)  
-        {  
-            *colon = '\0';  
-            port = atoi(colon + 1);  
-        }  
-          
-        // 复制主机名  
-        strncpy(host, trimmed_line, sizeof(host) - 1);  
-  
-        // 检查是否重复    
-        int is_duplicate = 0;    
-        for (int j = 0; j < g_state.host_count; j++)    
-        {    
-            if (strcmp(g_state.hosts[j].host, host) == 0 &&     
-                g_state.hosts[j].port == port)    
-            {    
-                is_duplicate = 1;    
-                fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (第 %d 行): %s:%d\n",     
-                        timestamp(), line_num, host, port);    
-                break;    
-            }    
-        }    
-    
-        if (is_duplicate)    
-        {    
-            continue;  
-        }  
-  
-        host_stats_t *h = &g_state.hosts[g_state.host_count];  
-        strncpy(h->host, host, sizeof(h->host) - 1);  
-        h->port = port;  
-        strncpy(h->note, note, sizeof(h->note) - 1);  
-        strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);  
-          
-        if (verbose)  
-        {  
-            fprintf(stderr, "[%s] [DEBUG]: 第 %d 行解析成功: host=%s, port=%d, note=%s, display_name=%s\n",  
-                    timestamp(), line_num, host, port,   
-                    note[0] ? note : "(无)",  
-                    display_name[0] ? display_name : "(无)");  
-        }  
-  
-        load_history(h);  
-        g_state.host_count++;  
-    }  
-  
-    fclose(f);  
-    if (verbose)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: 配置文件读取完成,共加载 %d 个主机\n",  
-                timestamp(), g_state.host_count);  
-    }  
+static void load_config(const char *config_file)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始读取配置文件: %s\n", timestamp(), config_file);
+    }
+    FILE *f = fopen(config_file, "r");
+    if (!f)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 配置文件打开失败: %s\n", timestamp(), config_file);
+        return;
+    }
+
+    char line[1024];
+    int line_num = 0;
+    while (fgets(line, sizeof(line), f) && g_state.host_count < MAX_HOSTS)
+    {
+        line_num++;
+
+        // 去除行首空格
+        char *trimmed_line = line;
+        while (*trimmed_line == ' ' || *trimmed_line == '\t')
+        {
+            trimmed_line++;
+        }
+
+        // 跳过注释和空行 - 使用 trimmed_line
+        if (trimmed_line[0] == '#' || trimmed_line[0] == '\n')
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 跳过第 %d 行 (注释或空行)\n", timestamp(), line_num);
+            }
+            continue;
+        }
+
+        char host[256] = {0};
+        int port = 10086;
+        char note[512] = {0};
+        char display_name[256] = {0};
+
+        // 格式: host:port|备注|前端显示主机名
+        char *first_pipe = strchr(trimmed_line, '|');
+        if (first_pipe)
+        {
+            *first_pipe = '\0';
+            char *second_pipe = strchr(first_pipe + 1, '|');
+            if (second_pipe)
+            {
+                *second_pipe = '\0';
+                strncpy(note, first_pipe + 1, sizeof(note) - 1);
+                strncpy(display_name, second_pipe + 1, sizeof(display_name) - 1);
+                char *newline = strchr(display_name, '\n');
+                if (newline)
+                    *newline = '\0';
+            }
+            else
+            {
+                strncpy(note, first_pipe + 1, sizeof(note) - 1);
+                char *newline = strchr(note, '\n');
+                if (newline)
+                    *newline = '\0';
+            }
+        }
+
+        // 解析端口 - 支持特殊前缀
+        char *colon = NULL;
+        int has_special_prefix = 0;
+
+        // 先检查特殊前缀(在修改字符串之前)
+        if (strncmp(trimmed_line, "txt:", 4) == 0)
+        {
+            has_special_prefix = 1;
+            // 跳过 txt: 前缀后再查找端口
+            colon = strchr(trimmed_line + 4, ':');
+        }
+        else if (strncmp(trimmed_line, "http:", 5) == 0)
+        {
+            has_special_prefix = 1;
+            // 对于 http: 前缀,需要先查找路径分隔符
+            const char *host_part = trimmed_line + 5;
+            char *slash = strchr(host_part, '/');
+
+            if (slash)
+            {
+                // 有路径,不提取端口,保持完整主机名
+                colon = NULL;
+                port = 0; // 端口设为 0
+            }
+            else
+            {
+                // 没有路径,正常查找端口
+                colon = strchr(host_part, ':');
+            }
+        }
+        else
+        {
+            // 普通主机
+            colon = strchr(trimmed_line, ':');
+        }
+
+        if (colon)
+        {
+            // 对于 http: 前缀,需要检查冒号后是否有斜杠
+            if (has_special_prefix && strncmp(trimmed_line, "http:", 5) == 0)
+            {
+                char *slash_after_colon = strchr(colon + 1, '/');
+                if (slash_after_colon)
+                {
+                    // 提取端口(在斜杠之前)
+                    char port_str[16];
+                    size_t port_len = slash_after_colon - (colon + 1);
+                    if (port_len < sizeof(port_str))
+                    {
+                        strncpy(port_str, colon + 1, port_len);
+                        port_str[port_len] = '\0';
+                        port = atoi(port_str);
+                        // 不要修改 colon,保持完整的主机名
+                        colon = NULL;
+                    }
+                }
+                else
+                {
+                    *colon = '\0';
+                    port = atoi(colon + 1);
+                }
+            }
+            else
+            {
+                *colon = '\0';
+                port = atoi(colon + 1);
+            }
+
+            // 特殊前缀允许端口为 0
+            if (has_special_prefix)
+            {
+                if (port < 0 || port > 65535)
+                {
+                    fprintf(stderr, "[%s] [WARN]: 无效的端口号 %d (第 %d 行)\n",
+                            timestamp(), port, line_num);
+                    continue;
+                }
+            }
+            else
+            {
+                // 普通主机端口必须有效
+                if (port <= 0 || port > 65535)
+                {
+                    fprintf(stderr, "[%s] [WARN]: 无效的端口号 %d (第 %d 行)\n",
+                            timestamp(), port, line_num);
+                    continue;
+                }
+            }
+        }
+        else
+        {
+            // 没有端口号
+            if (has_special_prefix)
+            {
+                // 特殊前缀允许无端口,自动填充为 0
+                port = 0;
+            }
+        }
+
+        // 复制主机名
+        strncpy(host, trimmed_line, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0'; // 确保字符串结束
+
+        // 去除末尾的换行符
+        char *newline = strchr(host, '\n');
+        if (newline)
+        {
+            *newline = '\0';
+        }
+        // 去除末尾的空格和制表符
+        int len = strlen(host);
+        while (len > 0 && (host[len - 1] == ' ' || host[len - 1] == '\t'))
+        {
+            host[--len] = '\0';
+        }
+        // 【新增】去除所有空白字符（空格、制表符、换行符、回车符）
+        char cleaned_host[256] = {0};
+        int j = 0;
+        for (int i = 0; host[i] != '\0' && (size_t)j < sizeof(cleaned_host) - 1; i++)
+        {
+            if (host[i] != ' ' && host[i] != '\t' && host[i] != '\n' && host[i] != '\r')
+            {
+                cleaned_host[j++] = host[i];
+            }
+        }
+        cleaned_host[j] = '\0';
+        strncpy(host, cleaned_host, sizeof(host) - 1);
+
+        // 检查是否重复
+        int is_duplicate = 0;
+        for (int j = 0; j < g_state.host_count; j++)
+        {
+            if (strcmp(g_state.hosts[j].host, host) == 0 &&
+                g_state.hosts[j].port == port)
+            {
+                is_duplicate = 1;
+                fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (第 %d 行): %s:%d\n",
+                        timestamp(), line_num, host, port);
+                break;
+            }
+        }
+
+        if (is_duplicate)
+        {
+            continue;
+        }
+
+        host_stats_t *h = &g_state.hosts[g_state.host_count];
+        strncpy(h->host, host, sizeof(h->host) - 1);
+        h->port = port;
+        strncpy(h->note, note, sizeof(h->note) - 1);
+        strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 第 %d 行解析成功: host=%s, port=%d, note=%s, display_name=%s\n",
+                    timestamp(), line_num, host, port,
+                    note[0] ? note : "(无)",
+                    display_name[0] ? display_name : "(无)");
+        }
+        // 初始化 max_history 并分配内存  
+	h->max_history = g_max_history;  
+	h->history = calloc(g_max_history, sizeof(check_record_t));  
+	if (!h->history) {  
+    		fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",  
+            		timestamp(), host, port);  
+    		continue;  // 跳过这个主机  
+	}
+
+        load_history(h);
+        g_state.host_count++;
+    }
+
+    fclose(f);
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 配置文件读取完成,共加载 %d 个主机\n",
+                timestamp(), g_state.host_count);
+    }
 }
 
 static void save_history(const host_stats_t *host)
 {
     // 确保目录存在
     struct stat st = {0};
-    if (stat(STATE_DIR, &st) == -1)
+    if (stat(g_state_dir, &st) == -1)
     {
-        if (mkdir(STATE_DIR, 0755) == -1)
+        if (mkdir(g_state_dir, 0755) == -1)
         {
-            fprintf(stderr, "[%s] [ERROR]: 无法创建目录 %s: %s\n", timestamp(), STATE_DIR, strerror(errno));
+            fprintf(stderr, "[%s] [ERROR]: 无法创建目录 %s: %s\n", timestamp(), g_state_dir, strerror(errno));
             return;
         }
     }
 
-    char filename[512];
-    snprintf(filename, sizeof(filename), "%s/%s_%d.dat", STATE_DIR, host->host, host->port);
+    // 创建安全的文件名(替换特殊字符)
+    char safe_host[512];
+    strncpy(safe_host, host->host, sizeof(safe_host) - 1);
+    safe_host[sizeof(safe_host) - 1] = '\0';
+
+    // 将 / 和 : 替换为 .
+    for (char *p = safe_host; *p; p++)
+    {
+        if (*p == '/' || *p == ':')
+        {
+            *p = '.';
+        }
+    }
+
+    char filename[2048];
+    snprintf(filename, sizeof(filename), "%s/%s_%d.dat", g_state_dir, safe_host, host->port);
 
     FILE *f = fopen(filename, "wb");
     if (!f)
@@ -899,7 +1140,7 @@ static void save_history(const host_stats_t *host)
 
     fwrite(&host->history_index, sizeof(int), 1, f);
     fwrite(&host->history_count, sizeof(int), 1, f);
-    fwrite(host->history, sizeof(check_record_t), MAX_HISTORY, f);
+    fwrite(host->history, sizeof(check_record_t), host->max_history, f);
     fwrite(&host->total_checks, sizeof(int), 1, f);
     fwrite(&host->success_v1, sizeof(int), 1, f);
     fwrite(&host->success_v2, sizeof(int), 1, f);
@@ -910,48 +1151,885 @@ static void save_history(const host_stats_t *host)
 
     if (verbose)
     {
-        fprintf(stderr, "[%s] [DEBUG]: 已保存 %s:%d 的历史记录 (共 %d 条)\n",
-                timestamp(), host->host, host->port, host->history_count);
+        fprintf(stderr, "[%s] [DEBUG]: 已保存 %s:%d 的历史记录到 %s (共 %d 条)\n",
+                timestamp(), host->host, host->port, filename, host->history_count);
     }
 }
 
-// 重新加载配置文件  
-static void reload_config(void) {  
-    if (g_state.config_file_path[0] == '\0') {  
-        return;  // 没有配置文件  
-    }  
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 检测到配置文件变化,开始重新加载\n", timestamp());  
-    }  
-      
-    pthread_mutex_lock(&g_state.lock);  
+// 重新加载配置文件
+static void reload_config(void)
+{
+    if (g_state.config_file_path[0] == '\0')
+    {
+        return; // 没有配置文件
+    }
 
-	// 保存所有主机的历史记录  
-    for (int i = 0; i < g_state.host_count; i++) {  
-        save_history(&g_state.hosts[i]);  
-        if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: 配置重载前已保存 %s:%d 的历史检测记录\n",  
-                    timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);  
-        }  
-    }  
-      
-    // 保存旧的主机数量  
-    int old_count = g_state.host_count;  
-      
-    // 清空现有配置  
-    g_state.host_count = 0;  
-    memset(g_state.hosts, 0, sizeof(g_state.hosts));  
-      
-    pthread_mutex_unlock(&g_state.lock);  
-      
-    // 重新加载配置文件  
-    load_config(g_state.config_file_path);  
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 配置重载完成: 旧主机数=%d, 新主机数=%d\n",  
-                timestamp(), old_count, g_state.host_count);  
-    }  
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 检测到配置文件变化,开始重新加载\n", timestamp());
+    }
+
+    pthread_mutex_lock(&g_state.lock);
+    // 保存所有主机的历史记录
+    for (int i = 0; i < g_state.host_count; i++)
+    {
+        save_history(&g_state.hosts[i]);
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 配置重载前已保存 %s:%d 的历史检测记录\n",
+                    timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);
+        }
+    }
+
+    // 保存旧的主机数量
+    int old_count = g_state.host_count;
+
+    // 清空现有配置
+    g_state.host_count = 0;
+    memset(g_state.hosts, 0, sizeof(g_state.hosts));
+
+    pthread_mutex_unlock(&g_state.lock);
+
+    // 重新加载配置文件
+    load_config(g_state.config_file_path);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 配置重载完成: 旧主机数=%d, 新主机数=%d\n",
+                timestamp(), old_count, g_state.host_count);
+    }
+}
+
+#define DNS_TYPE_TXT 16
+#define DNS_CLASS_IN 1
+
+// 将域名转换为 DNS 查询格式
+static int domain_to_qname(const char *domain, uint8_t *buf)
+{
+    const char *pos = domain;
+    uint8_t *label_len_pos = buf;
+    uint8_t label_len = 0;
+    int out_len = 1;
+    *label_len_pos = 0;
+
+    while (*pos)
+    {
+        if (*pos == '.')
+        {
+            *label_len_pos = label_len;
+            label_len = 0;
+            label_len_pos = buf + out_len;
+            *label_len_pos = 0;
+            out_len++;
+            pos++;
+            continue;
+        }
+        buf[out_len++] = (uint8_t)*pos;
+        label_len++;
+        pos++;
+    }
+    *label_len_pos = label_len;
+    buf[out_len++] = 0;
+    return out_len;
+}
+
+// 构造 DNS 查询包
+static int build_dns_query(const char *domain, uint8_t *out_buf, int out_buf_size, uint16_t txid)
+{
+    if (out_buf_size < 12)
+        return -1;
+    memset(out_buf, 0, out_buf_size);
+
+    // DNS 头部
+    out_buf[0] = (uint8_t)(txid >> 8);
+    out_buf[1] = (uint8_t)(txid & 0xFF);
+    out_buf[2] = 0x01; // 标准查询
+    out_buf[3] = 0x00;
+    out_buf[4] = 0x00;
+    out_buf[5] = 0x01; // 1 个问题
+    out_buf[6] = 0x00;
+    out_buf[7] = 0x00;
+    out_buf[8] = 0x00;
+    out_buf[9] = 0x00;
+    out_buf[10] = 0x00;
+    out_buf[11] = 0x00;
+
+    int pos = 12;
+    uint8_t qname[256];
+    int qname_len = domain_to_qname(domain, qname);
+    memcpy(out_buf + pos, qname, qname_len);
+    pos += qname_len;
+
+    // 查询类型和类
+    out_buf[pos++] = 0x00;
+    out_buf[pos++] = DNS_TYPE_TXT;
+    out_buf[pos++] = 0x00;
+    out_buf[pos++] = DNS_CLASS_IN;
+
+    return pos;
+}
+
+// 跳过 DNS 名称字段
+static int dns_skip_name(const uint8_t *buf, int buf_len, int offset)
+{
+    while (1)
+    {
+        if (offset >= buf_len)
+            return -1;
+        uint8_t len = buf[offset];
+        if ((len & 0xC0) == 0xC0)
+            return offset + 2; // 压缩指针
+        if (len == 0)
+            return offset + 1;
+        offset += 1 + len;
+    }
+}
+
+// 解析 TXT 记录数据
+static int extract_txt_value(const uint8_t *rdata, int rdlen, char *txt_value, int txt_size)
+{
+    int p = 0;
+    int total_len = 0;
+
+    while (p < rdlen && total_len < txt_size - 1)
+    {
+        uint8_t seg_len = rdata[p++];
+        if (p + seg_len > rdlen)
+            break;
+
+        int copy_len = (total_len + seg_len < txt_size - 1) ? seg_len : (txt_size - 1 - total_len);
+        memcpy(txt_value + total_len, rdata + p, copy_len);
+        total_len += copy_len;
+        p += seg_len;
+    }
+
+    txt_value[total_len] = '\0';
+    return total_len > 0 ? 0 : -1;
+}
+
+// 解析 DNS 响应
+static int parse_dns_txt_response(const uint8_t *buf, int buf_len, uint16_t expected_txid, char *txt_value, int txt_size)
+{
+    if (buf_len < 12)
+        return -1;
+
+    uint16_t txid = (buf[0] << 8) | buf[1];
+    uint16_t flags = (buf[2] << 8) | buf[3];
+    uint16_t qdcount = (buf[4] << 8) | buf[5];
+    uint16_t ancount = (buf[6] << 8) | buf[7];
+
+    // 验证事务 ID 和响应标志
+    if (txid != expected_txid || (flags & 0x8000) == 0)
+        return -1;
+
+    // 检查响应码
+    int rcode = flags & 0x000F;
+    if (rcode != 0)
+    {
+        if (verbose)
+        {
+            const char *rcode_str[] = {"NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED"};
+            fprintf(stderr, "[%s] [DEBUG]: DNS 错误: %s\n",
+                    timestamp(), rcode < 6 ? rcode_str[rcode] : "UNKNOWN");
+        }
+        return -1;
+    }
+
+    if (ancount == 0)
+        return -1;
+
+    // 跳过问题部分
+    int offset = 12;
+    for (int i = 0; i < qdcount; i++)
+    {
+        int no = dns_skip_name(buf, buf_len, offset);
+        if (no < 0)
+            return -1;
+        offset = no + 4;
+    }
+
+    // 解析回答部分
+    for (int i = 0; i < ancount; i++)
+    {
+        int no = dns_skip_name(buf, buf_len, offset);
+        if (no < 0)
+            break;
+        offset = no;
+
+        if (offset + 10 > buf_len)
+            break;
+
+        uint16_t atype = (buf[offset] << 8) | buf[offset + 1];
+        uint16_t aclass = (buf[offset + 2] << 8) | buf[offset + 3];
+        uint16_t rdlength = (buf[offset + 8] << 8) | buf[offset + 9];
+        offset += 10;
+
+        if (offset + rdlength > buf_len)
+            break;
+
+        if (atype == DNS_TYPE_TXT && aclass == DNS_CLASS_IN)
+        {
+            return extract_txt_value(buf + offset, rdlength, txt_value, txt_size);
+        }
+
+        offset += rdlength;
+    }
+
+    return -1;
+}
+
+// TXT 记录解析函数
+static int resolve_txt_record(const char *input_host, char *resolved_ip, int *resolved_port)
+{
+    // 去掉 txt: 前缀
+    const char *host = input_host + 4;
+
+    // 去掉端口（如果有）
+    char hostname[256];
+    strncpy(hostname, host, sizeof(hostname) - 1);
+    hostname[sizeof(hostname) - 1] = '\0';
+
+    // 去掉末尾换行符或空白字符
+    trim_right(hostname);
+
+    char *colon = strchr(hostname, ':');
+    if (colon)
+    {
+        *colon = '\0';
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: TXT 记录查询: %s\n", timestamp(), hostname);
+    }
+
+    // DNS 服务器列表
+    const char *dns_servers[] = {"119.29.29.29", "223.5.5.5", "1.1.1.1"};
+    int dns_server_count = 3;
+
+    // 尝试每个 DNS 服务器
+    for (int si = 0; si < dns_server_count; si++)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 尝试 DNS 服务器 %d/%d: %s\n",
+                    timestamp(), si + 1, dns_server_count, dns_servers[si]);
+        }
+
+        // 创建 UDP socket
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: Socket 创建失败: %s\n",
+                        timestamp(), strerror(errno));
+            }
+            continue;
+        }
+
+        // 设置超时
+        struct timeval tv = {3, 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        // 构造 DNS 查询
+        uint8_t query[512];
+        uint16_t txid = (uint16_t)(rand() & 0xFFFF);
+        int qlen = build_dns_query(hostname, query, sizeof(query), txid);
+
+        if (qlen < 0)
+        {
+            close(sock);
+            continue;
+        }
+
+        // 发送查询
+        struct sockaddr_in servaddr = {0};
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_port = htons(53);
+        inet_pton(AF_INET, dns_servers[si], &servaddr.sin_addr);
+
+        if (sendto(sock, query, qlen, 0, (struct sockaddr *)&servaddr, sizeof(servaddr)) != qlen)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 发送失败: %s\n", timestamp(), strerror(errno));
+            }
+            close(sock);
+            continue;
+        }
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 已发送 %d 字节，等待响应...\n", timestamp(), qlen);
+        }
+
+        // 接收响应
+        uint8_t resp[2048];
+        int recvd = recvfrom(sock, resp, sizeof(resp), 0, NULL, NULL);
+        close(sock);
+
+        if (recvd <= 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 接收失败或超时\n", timestamp());
+            }
+            continue;
+        }
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 收到 %d 字节响应\n", timestamp(), recvd);
+        }
+
+        // 解析响应
+        char txt_value[256];
+        if (parse_dns_txt_response(resp, recvd, txid, txt_value, sizeof(txt_value)) == 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: TXT 记录值: %s\n", timestamp(), txt_value);
+            }
+
+            // 解析 address:port 格式
+            char address[256];
+            int port;
+            if (sscanf(txt_value, "%255[^:]:%d", address, &port) == 2 &&
+                port > 0 && port <= 65535)
+            {
+
+                // 检查是否为 IP 地址
+                struct in_addr ipv4_addr;
+                if (inet_pton(AF_INET, address, &ipv4_addr) == 1)
+                {
+                    // 是 IP 地址，直接使用
+                    strncpy(resolved_ip, address, 255);
+                    resolved_ip[255] = '\0';
+                    *resolved_port = port;
+
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: TXT 记录解析成功 (IP): %s:%d\n",
+                                timestamp(), resolved_ip, *resolved_port);
+                    }
+                    return 0;
+                }
+                else
+                {
+                    // 是主机名，需要解析为 IP
+                    struct addrinfo hints = {0};
+                    struct addrinfo *result = NULL;
+                    hints.ai_family = AF_INET;
+                    hints.ai_socktype = SOCK_DGRAM;
+
+                    if (getaddrinfo(address, NULL, &hints, &result) == 0)
+                    {
+                        struct sockaddr_in *addr = (struct sockaddr_in *)result->ai_addr;
+                        inet_ntop(AF_INET, &addr->sin_addr, resolved_ip, 255);
+                        *resolved_port = port;
+                        freeaddrinfo(result);
+
+                        if (verbose)
+                        {
+                            fprintf(stderr, "[%s] [DEBUG]: TXT 记录解析成功 (主机名 %s -> IP): %s:%d\n",
+                                    timestamp(), address, resolved_ip, *resolved_port);
+                        }
+                        return 0;
+                    }
+                    else
+                    {
+                        if (verbose)
+                        {
+                            fprintf(stderr, "[%s] [DEBUG]: 无法解析主机名: %s\n", timestamp(), address);
+                        }
+                    }
+                }
+            }
+            else
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: TXT 记录格式不正确: %s\n", timestamp(), txt_value);
+                }
+            }
+        }
+    }
+
+    // if (verbose)
+    // {
+    fprintf(stderr, "[%s] [ERROR]: 无法解析 %s 的TXT记录\n", timestamp(), hostname);
+    //}
+    return -1;
+}
+
+// 不区分大小写查找 Location 头
+static char *find_location_header(const char *response)
+{
+    const char *p = response;
+    while (*p)
+    {
+        if ((p[0] == 'l' || p[0] == 'L') &&
+            (p[1] == 'o' || p[1] == 'O') &&
+            (p[2] == 'c' || p[2] == 'C') &&
+            (p[3] == 'a' || p[3] == 'A') &&
+            (p[4] == 't' || p[4] == 'T') &&
+            (p[5] == 'i' || p[5] == 'I') &&
+            (p[6] == 'o' || p[6] == 'O') &&
+            (p[7] == 'n' || p[7] == 'N') &&
+            p[8] == ':')
+        {
+            return (char *)(p + 9);
+        }
+        p++;
+    }
+    return NULL;
+}
+
+// 解析地址:端口格式（支持 IP 和主机名）
+static int parse_address_port(const char *address_str, char *resolved_ip, int *resolved_port)
+{
+    char address[256];
+    int port;
+
+    if (sscanf(address_str, "%255[^:]:%d", address, &port) != 2 ||
+        port <= 0 || port > 65535)
+    {
+        return -1;
+    }
+
+    // 检查是否为 IP 地址
+    struct in_addr ipv4_addr;
+    struct in6_addr ipv6_addr;
+
+    if (inet_pton(AF_INET, address, &ipv4_addr) == 1 ||
+        inet_pton(AF_INET6, address, &ipv6_addr) == 1)
+    {
+        // 直接使用 IP 地址
+        strncpy(resolved_ip, address, 255);
+        resolved_ip[255] = '\0';
+        *resolved_port = port;
+        return 0;
+    }
+
+    // 尝试解析为主机名
+    struct addrinfo hints = {0};
+    struct addrinfo *result = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+
+    if (getaddrinfo(address, NULL, &hints, &result) == 0)
+    {
+        struct sockaddr_in *addr = (struct sockaddr_in *)result->ai_addr;
+        inet_ntop(AF_INET, &addr->sin_addr, resolved_ip, 255);
+        *resolved_port = port;
+        freeaddrinfo(result);
+        return 0;
+    }
+
+    return -1;
+}
+
+// 在响应内容中查找 address:port 格式
+static int find_address_in_content(const char *content, char *resolved_ip, int *resolved_port)
+{
+    // 查找响应体的开始位置（双换行符之后）
+    const char *body = strstr(content, "\r\n\r\n");
+    if (body)
+    {
+        body += 4; // 跳过 \r\n\r\n
+    }
+    else
+    {
+        body = strstr(content, "\n\n");
+        if (body)
+        {
+            body += 2; // 跳过 \n\n
+        }
+        else
+        {
+            body = content; // 如果找不到分隔符，使用整个内容
+        }
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 响应体内容: '%s'\n", timestamp(), body);
+    }
+
+    const char *p = body; // 从响应体开始查找
+
+    while (*p)
+    {
+        if (isdigit(*p) || isalpha(*p))
+        {
+            char candidate[512];
+            int i = 0;
+
+            while (*p && !isspace(*p) && (size_t)i < sizeof(candidate) - 1)
+            {
+                candidate[i++] = *p++;
+            }
+            candidate[i] = '\0';
+
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 尝试解析候选: '%s'\n",
+                        timestamp(), candidate);
+            }
+
+            if (parse_address_port(candidate, resolved_ip, resolved_port) == 0)
+            {
+                return 0;
+            }
+        }
+        else
+        {
+            p++;
+        }
+    }
+
+    return -1;
+}
+
+// HTTP 重定向解析函数（支持最多 3 次重定向）
+static int resolve_http_redirect(const char *input_host, int input_port,
+                                 char *resolved_ip, int *resolved_port)
+{
+    // 去掉 http: 前缀
+    const char *host = input_host + 5; // 跳过 "http:"
+
+    // 解析主机名和端口
+    char current_host[256];
+    int current_port = input_port;
+    char current_path[256] = "/"; // 默认路径为根路径
+
+    strncpy(current_host, host, sizeof(current_host) - 1);
+    current_host[sizeof(current_host) - 1] = '\0';
+
+    // 先查找路径分隔符
+    char *slash = strchr(current_host, '/');
+    if (slash)
+    {
+        // 保存路径部分
+        strncpy(current_path, slash, sizeof(current_path) - 1);
+        current_path[sizeof(current_path) - 1] = '\0';
+        *slash = '\0'; // 截断主机名部分
+    }
+
+    char *colon = strchr(current_host, ':');
+    if (colon)
+    {
+        *colon = '\0';
+        current_port = atoi(colon + 1);
+    }
+
+    // 如果端口为 0，使用默认 HTTP 端口
+    if (current_port == 0)
+    {
+        current_port = 80;
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: HTTP 重定向查询: %s:%d%s\n",
+                timestamp(), current_host, current_port, current_path);
+    }
+
+    // 保存最后一次成功解析的完整重定向 URL（不去除路径）
+    char last_redirect_url[512] = {0};
+    int has_redirect = 0;
+
+    // 最多支持 3 次重定向
+    int redirect_count = 0;
+    const int MAX_REDIRECTS = 3;
+
+    while (redirect_count < MAX_REDIRECTS)
+    {
+        // 重试机制:每次重定向尝试 3 次
+        int success = 0;
+        char response[4096] = {0};
+        int http_status = 0;
+
+        for (int retry = 0; retry < 3 && !success; retry++)
+        {
+            if (verbose && retry > 0)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: HTTP 请求重试 %d/3\n",
+                        timestamp(), retry + 1);
+            }
+
+            // 创建 TCP socket
+            int sock = socket(AF_INET, SOCK_STREAM, 0);
+            if (sock < 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: Socket 创建失败\n", timestamp());
+                }
+                continue;
+            }
+
+            // 设置超时
+            struct timeval timeout;
+            timeout.tv_sec = 5;
+            timeout.tv_usec = 0;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+            // 解析主机名
+            struct addrinfo hints = {0};
+            struct addrinfo *result = NULL;
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+
+            if (getaddrinfo(current_host, NULL, &hints, &result) != 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 主机名解析失败: %s\n",
+                            timestamp(), current_host);
+                }
+                close(sock);
+                continue;
+            }
+
+            struct sockaddr_in addr = {0};
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(current_port);
+            addr.sin_addr = ((struct sockaddr_in *)result->ai_addr)->sin_addr;
+            freeaddrinfo(result);
+
+            // 连接
+            if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 连接失败: %s:%d\n",
+                            timestamp(), current_host, current_port);
+                }
+                close(sock);
+                continue;
+            }
+
+            // 发送 HTTP HEAD 请求(使用完整路径)
+            char request[1024];
+            snprintf(request, sizeof(request),
+                     "GET %s HTTP/1.1\r\n"
+                     "Host: %s:%d\r\n"
+                     "Connection: close\r\n"
+                     "\r\n",
+                     current_path, current_host, current_port);
+
+            if (send(sock, request, strlen(request), 0) < 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 发送请求失败\n", timestamp());
+                }
+                close(sock);
+                continue;
+            }
+
+            // 接收响应
+            int total_received = 0;
+            while ((size_t)total_received < sizeof(response) - 1)
+            {
+                int n = recv(sock, response + total_received,
+                             sizeof(response) - total_received - 1, 0);
+                if (n <= 0)
+                    break;
+                total_received += n;
+            }
+            response[total_received] = '\0';
+            close(sock);
+
+            if (total_received > 0)
+            {
+                success = 1;
+
+                // 解析 HTTP 状态码
+                if (sscanf(response, "HTTP/1.%*d %d", &http_status) != 1)
+                {
+                    http_status = 0;
+                }
+
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 收到 %d 字节 HTTP 响应，状态码: %d\n",
+                            timestamp(), total_received, http_status);
+                    fprintf(stderr, "[%s] [DEBUG]: HTTP 响应内容:\n%s\n",
+                            timestamp(), response);
+                }
+                break;
+            }
+
+            if (retry < 2)
+            {
+                usleep(500000); // 等待 0.5 秒后重试
+            }
+        }
+
+        if (!success)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: HTTP 请求失败(已重试 3 次)\n",
+                        timestamp());
+            }
+            break; // 退出重定向循环
+        }
+
+        // 查找 Location 头(不区分大小写)
+        char *location = find_location_header(response);
+
+        if (location)
+        {
+            // 找到重定向地址
+            char redirect_url[512];
+            int i = 0;
+
+            // 跳过空格
+            while (*location == ' ')
+                location++;
+
+            // 提取完整 URL(直到换行)，不去除路径
+            while (*location && *location != '\r' && *location != '\n' &&
+                   (size_t)i < sizeof(redirect_url) - 1)
+            {
+                redirect_url[i++] = *location++;
+            }
+            redirect_url[i] = '\0';
+
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 重定向 %d/%d: %s\n",
+                        timestamp(), redirect_count + 1, MAX_REDIRECTS, redirect_url);
+            }
+
+            // 保存这个重定向 URL（完整的，包含路径）
+            strncpy(last_redirect_url, redirect_url, sizeof(last_redirect_url) - 1);
+            last_redirect_url[sizeof(last_redirect_url) - 1] = '\0';
+            has_redirect = 1;
+
+            // 解析重定向 URL 以准备下一次请求
+            char *url_start = redirect_url;
+            if (strncmp(url_start, "http://", 7) == 0)
+            {
+                url_start += 7;
+            }
+            else if (strncmp(url_start, "https://", 8) == 0)
+            {
+                url_start += 8;
+            }
+
+            // 分离主机名和路径
+            char *slash_pos = strchr(url_start, '/');
+            if (slash_pos)
+            {
+                // 保存路径
+                strncpy(current_path, slash_pos, sizeof(current_path) - 1);
+                current_path[sizeof(current_path) - 1] = '\0';
+                *slash_pos = '\0'; // 临时截断以解析主机名
+            }
+            else
+            {
+                strcpy(current_path, "/"); // 默认根路径
+            }
+
+            // 解析主机名和端口
+            strncpy(current_host, url_start, sizeof(current_host) - 1);
+            current_host[sizeof(current_host) - 1] = '\0';
+
+            char *colon_pos = strchr(current_host, ':');
+            if (colon_pos)
+            {
+                *colon_pos = '\0';
+                current_port = atoi(colon_pos + 1);
+            }
+            else
+            {
+                current_port = 80; // 默认 HTTP 端口
+            }
+
+            redirect_count++;
+            continue; // 继续下一次重定向
+        }
+
+        // 没有 Location 头
+        if (http_status == 200)
+        {
+            // 200 响应但没有重定向，尝试从响应内容中查找 address:port
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 收到 200 响应但无 Location 头，尝试解析响应内容\n",
+                        timestamp());
+                fprintf(stderr, "[%s] [DEBUG]: 响应内容: %s\n", timestamp(), response);
+            }
+
+            char temp_ip[256];
+            int temp_port;
+            if (find_address_in_content(response, temp_ip, &temp_port) == 0)
+            {
+                // 从响应内容找到了地址
+                strncpy(resolved_ip, temp_ip, 255);
+                resolved_ip[255] = '\0';
+                *resolved_port = temp_port;
+
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 从 200 响应内容解析到地址: %s:%d\n",
+                            timestamp(), temp_ip, temp_port);
+                }
+                return 0;
+            }
+        }
+
+        // 没有找到重定向，退出循环
+        break;
+    }
+
+    // 处理最终结果
+    if (has_redirect)
+    {
+        // 有重定向记录，使用最后一次重定向的 URL
+        char *url_start = last_redirect_url;
+
+        // 去除 http:// 或 https:// 前缀
+        if (strncmp(url_start, "http://", 7) == 0)
+        {
+            url_start += 7;
+        }
+        else if (strncmp(url_start, "https://", 8) == 0)
+        {
+            url_start += 8;
+        }
+
+        // 去除路径部分（只保留主机:端口）
+        char *slash_pos = strchr(url_start, '/');
+        if (slash_pos)
+        {
+            *slash_pos = '\0';
+        }
+
+        // 解析为 address:port
+        if (parse_address_port(url_start, resolved_ip, resolved_port) == 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: HTTP 重定向最终解析: %s:%d\n",
+                        timestamp(), resolved_ip, *resolved_port);
+            }
+            return 0;
+        }
+    }
+
+    // 没有重定向也没有从响应内容解析到地址
+    // if (verbose) {
+    fprintf(stderr, "[%s] [ERROR]: 无法获取 %s 的重定向地址或响应内容\n",
+            timestamp(), input_host);
+    //}
+    return -1;
 }
 
 // 生成 HTML 页面
@@ -1155,9 +2233,9 @@ void generate_html(char *buf, size_t bufsize)
                        "::-webkit-scrollbar-track{background:#f1f1f1;border-radius:10px;}\n"
                        "::-webkit-scrollbar-thumb{background:#888;border-radius:10px;}\n"
                        "::-webkit-scrollbar-thumb:hover{background:#555;}\n"
-                       ".footer{margin-top:40px;padding:20px;text-align:center;border-top:1px solid var(--border);color:var(--muted);font-size:14px;}\n"  
-			".footer a{color:var(--accent);text-decoration:none;font-weight:600;}\n"  
-			".footer a:hover{text-decoration:underline;}\n"
+                       ".footer{margin-top:40px;padding:20px;text-align:center;border-top:1px solid var(--border);color:var(--muted);font-size:14px;}\n"
+                       ".footer a{color:var(--accent);text-decoration:none;font-weight:600;}\n"
+                       ".footer a:hover{text-decoration:underline;}\n"
                        "@keyframes blink-red {\n"
                        "  0%%, 100%% { background-color: transparent; }\n"
                        "  50%% { background-color: #fee2e2; }\n" // 浅红色
@@ -1171,31 +2249,31 @@ void generate_html(char *buf, size_t bufsize)
                        "</style>\n"
                        "<script>\n"
                        "var sortOrder = 0;\n"
-                       "function filterTable() {\n"  
-                       "  var versionFilter = document.getElementById('versionFilter').value;\n"  
-                       "  var statusFilter = document.getElementById('statusFilter').value;\n"  
-                       "  var table = document.getElementById('hostTable');\n"  
-                       "  var rows = table.getElementsByTagName('tr');\n"  
-                       "  for (var i = 1; i < rows.length; i++) {\n"  
-                       "    var row = rows[i];\n"  
-                       "    var versionCell = row.cells[2].textContent;\n"  
-                       "    var statusCell = row.cells[4].textContent;\n"  
-                       "    var showVersion = (versionFilter === 'all');\n"  
-                       "    if (!showVersion) {\n"   
-                       "      var badges = versionCell.split(/\\s+/);\n"  
-                       "      for (var j = 0; j < badges.length; j++) {\n"  
-                       "        if (badges[j] === versionFilter) {\n"  
-                       "          showVersion = true;\n"  
-                       "          break;\n"  
-                       "        }\n"  
-                       "      }\n"  
-                       "    }\n"  
-                       "    var showStatus = (statusFilter === 'all' || \n"  
-                       "                     (statusFilter === 'online' && statusCell.includes('在线')) ||\n"  
-                       "                     (statusFilter === 'offline' && statusCell.includes('离线')));\n"  
-                       "    row.style.display = (showVersion && showStatus) ? '' : 'none';\n"  
-                       "  }\n"  
-                       "  updateTopNotice();\n"  
+                       "function filterTable() {\n"
+                       "  var versionFilter = document.getElementById('versionFilter').value;\n"
+                       "  var statusFilter = document.getElementById('statusFilter').value;\n"
+                       "  var table = document.getElementById('hostTable');\n"
+                       "  var rows = table.getElementsByTagName('tr');\n"
+                       "  for (var i = 1; i < rows.length; i++) {\n"
+                       "    var row = rows[i];\n"
+                       "    var versionCell = row.cells[2].textContent;\n"
+                       "    var statusCell = row.cells[4].textContent;\n"
+                       "    var showVersion = (versionFilter === 'all');\n"
+                       "    if (!showVersion) {\n"
+                       "      var badges = versionCell.split(/\\s+/);\n"
+                       "      for (var j = 0; j < badges.length; j++) {\n"
+                       "        if (badges[j] === versionFilter) {\n"
+                       "          showVersion = true;\n"
+                       "          break;\n"
+                       "        }\n"
+                       "      }\n"
+                       "    }\n"
+                       "    var showStatus = (statusFilter === 'all' || \n"
+                       "                     (statusFilter === 'online' && statusCell.includes('在线')) ||\n"
+                       "                     (statusFilter === 'offline' && statusCell.includes('离线')));\n"
+                       "    row.style.display = (showVersion && showStatus) ? '' : 'none';\n"
+                       "  }\n"
+                       "  updateTopNotice();\n"
                        "}\n"
                        "function copyToClipboard(text) {\n"
                        "  if (navigator.clipboard && window.isSecureContext) {\n"
@@ -1300,7 +2378,7 @@ void generate_html(char *buf, size_t bufsize)
                        "  \n"
                        "  var html = '<div class=\"modal-content\" onclick=\"event.stopPropagation()\">';\n"
                        "  html += '<div class=\"modal-header\">';\n"
-                       "  html += '<div class=\"modal-title\">' + host + ':' + port + ' 历史检测记录</div>';\n"
+                       "  html += '<div class=\"modal-title\">' + host + (port ? ':' + port : '') + ' 历史检测记录</div>';\n"
                        "  html += '<button class=\"modal-close\" onclick=\"closeHistoryModal()\">×</button>';\n"
                        "  html += '</div>';\n"
                        "  html += '<div class=\"history-grid\">';\n"
@@ -1382,8 +2460,8 @@ void generate_html(char *buf, size_t bufsize)
                        "    if (s.indexOf('离线') !== -1) {\n"
                        "      offline++;\n"
                        "      if (!firstOfflineHost) {\n" // 记录第一个离线主机
-                       "        firstOfflineHost = rows[i].cells[0].textContent;\n"
-                       "        firstOfflinePort = rows[i].cells[1].textContent;\n"
+                       "        firstOfflineHost = rows[i].getAttribute('data-host');\n"
+                       "        firstOfflinePort = rows[i].getAttribute('data-port');\n"
                        "      }\n"
                        "    }\n"
                        "  }\n"
@@ -1400,7 +2478,7 @@ void generate_html(char *buf, size_t bufsize)
                        "function scrollToTable(){ var el = document.querySelector('.table-wrap'); if(el) el.scrollIntoView({behavior:'smooth',block:'start'}); }\n"
                        "\n"
                        "function scrollToHost(host, port) {\n"
-                       "  var rowId = 'host-' + host.replace(/\\./g, '-') + '-' + port;\n" // 替换点号为连字符
+                       "  var rowId = 'host-' + host.replace(/\\./g, '-').replace(/:/g, '-').replace(/\\//g, '-') + '-' + port;\n" // 替换点号为连字符
                        "  var row = document.getElementById(rowId);\n"
                        "  if (!row) return;\n"
                        "  \n"
@@ -1415,29 +2493,29 @@ void generate_html(char *buf, size_t bufsize)
                        "    }, 3000);  // 5次闪烁 × 0.6秒 = 3秒\n"
                        "  }, 500);  // 等待滚动完成\n"
                        "}\n"
-                       "function manualRefresh() { \n" 
-                       "var btn = document.getElementById('refreshBtn');\n"  
-                       "btn.disabled = true; \n" 
-                       "btn.style.opacity = '0.6';\n"  
-                       "btn.style.transform = 'scale(0.95)';\n"  
-                       "btn.textContent = '检测中...';\n"  
-                       "fetch('/refresh')\n"  
-                       ".then(response => response.json())\n"  
-                       ".then(data => {\n"  
-                       "if (data.success) {\n"  
-                       "showToast('检测成功', true);\n"  
-                       "setTimeout(() => location.reload(), 1000);\n"  
-                       "} else {\n"  
-                       "showToast(data.message, false);\n"  
-                       "btn.disabled = false;\n"  
-                       "btn.style.opacity = '1';\n"  
-                       "btn.style.transform = 'scale(1)';\n"  
-                       "btn.textContent = '立即检测';\n"  
-                       "}\n"  
-                       "})\n"  
-                       ".catch(err => {\n"  
-                       "showToast('检测失败,请稍后重试', false);\n"  
-                       "btn.disabled = false;\n"  
+                       "function manualRefresh() { \n"
+                       "var btn = document.getElementById('refreshBtn');\n"
+                       "btn.disabled = true; \n"
+                       "btn.style.opacity = '0.6';\n"
+                       "btn.style.transform = 'scale(0.95)';\n"
+                       "btn.textContent = '检测中...';\n"
+                       "fetch('/refresh')\n"
+                       ".then(response => response.json())\n"
+                       ".then(data => {\n"
+                       "if (data.success) {\n"
+                       "showToast('检测成功', true);\n"
+                       "setTimeout(() => location.reload(), 1000);\n"
+                       "} else {\n"
+                       "showToast(data.message, false);\n"
+                       "btn.disabled = false;\n"
+                       "btn.style.opacity = '1';\n"
+                       "btn.style.transform = 'scale(1)';\n"
+                       "btn.textContent = '立即检测';\n"
+                       "}\n"
+                       "})\n"
+                       ".catch(err => {\n"
+                       "showToast('检测失败,请稍后重试', false);\n"
+                       "btn.disabled = false;\n"
                        "btn.style.opacity = '1';\n"
                        "btn.style.transform = 'scale(1)';\n"
                        "btn.textContent = '立即检测';\n"
@@ -1523,7 +2601,7 @@ void generate_html(char *buf, size_t bufsize)
     // 注意：下面保留原有遍历逻辑与字段，但为了让前端的进度条动画更平滑，增加 data-target 属性并保持原有 class 名称与文本内容不变（中文注释）
     for (int i = 0; i < g_state.host_count; i++)
     {
-        if (len >= bufsize - 2000)
+        if ((size_t)len >= bufsize - 2000)
             break;
 
         host_stats_t *h = &g_state.hosts[i];
@@ -1533,7 +2611,7 @@ void generate_html(char *buf, size_t bufsize)
         safe_host_id[sizeof(safe_host_id) - 1] = '\0';
         for (char *p = safe_host_id; *p; p++)
         {
-            if (*p == '.')
+            if (*p == '.' || *p == ':' || *p == '/')
                 *p = '-';
         }
 
@@ -1602,10 +2680,10 @@ void generate_html(char *buf, size_t bufsize)
         if (h->history_count > 0)
         {
             // 从最旧的记录开始遍历(循环数组的正确顺序)
-            int start_idx = (h->history_count < MAX_HISTORY) ? 0 : h->history_index;
+            int start_idx = (h->history_count < h->max_history) ? 0 : h->history_index;
             for (int j = 0; j < h->history_count; j++)
             {
-                int idx = (start_idx + j) % MAX_HISTORY;
+                int idx = (start_idx + j) % h->max_history;
                 char record[64];
                 snprintf(record, sizeof(record), "%ld:%d%s",
                          h->history[idx].timestamp,
@@ -1625,16 +2703,48 @@ void generate_html(char *buf, size_t bufsize)
         snprintf(gradient_bg, sizeof(gradient_bg),
                  "background:linear-gradient(90deg, hsl(%d, 90%%, 50%%), hsl(%d, 90%%, 40%%))",
                  hue, hue);
+        // 检测是否有特殊前缀
+        char display_host[256];
+        char display_port[32];
+        char copy_text[512];
+
         const char *display = h->display_name[0] ? h->display_name : h->host;
 
+        if (strncmp(h->host, "txt:", 4) == 0 || strncmp(h->host, "http:", 5) == 0)
+        {
+            // 显示原始主机名（包含前缀）
+            strncpy(display_host, display, sizeof(display_host) - 1);
+            display_host[sizeof(display_host) - 1] = '\0';
+
+            // 端口显示为 "" 或实际端口
+            if (h->port > 0)
+            {
+                snprintf(display_port, sizeof(display_port), "%d", h->port);
+                snprintf(copy_text, sizeof(copy_text), "%s:%d", display_host, h->port);
+            }
+            else
+            {
+                strncpy(display_port, "", sizeof(display_port) - 1);
+                strncpy(copy_text, display_host, sizeof(copy_text) - 1); // 没有端口时不加冒号
+            }
+        }
+        else
+        {
+            // 普通主机，正常显示
+            strncpy(display_host, display, sizeof(display_host) - 1);
+            display_host[sizeof(display_host) - 1] = '\0';
+            snprintf(display_port, sizeof(display_port), "%d", h->port);
+            snprintf(copy_text, sizeof(copy_text), "%s:%d", display_host, h->port);
+        }
+
         len += snprintf(buf + len, bufsize - len,
-                        "<tr id='host-%s-%d'>"
-                        "<td class='host-cell' onclick='copyToClipboard(\"%s:%d\")'>%s</td>"
-                        "<td>%d</td>"
+                        "<tr id='host-%s-%d' data-host='%s' data-port='%d'>"
+                        "<td class='host-cell' onclick='copyToClipboard(\"%s\")'>%s</td>"
+                        "<td>%s</td>"
                         "<td>%s</td>"
                         "<td onmouseenter='showHistoryTooltip(event, \"%s\")' "
                         "onmouseleave='hideHistoryTooltip()' "
-                        "onclick='showHistoryModal(\"%s\", %d, \"%s\")' "
+                        "onclick='showHistoryModal(\"%s\", \"%s\", \"%s\")' "
                         "style='cursor: pointer;'>"
                         "<div class='progress-container'>"
                         "<div class='progress-bar-bg' style='width: %d%%; %s'></div>" // 使用动态渐变背景
@@ -1645,12 +2755,12 @@ void generate_html(char *buf, size_t bufsize)
                         "<td>%s</td>"
                         "<td>%s</td>"
                         "</tr>\n",
-                        safe_host_id, h->port,
-                        display, h->port, display,
-                        h->port,
+                        safe_host_id, h->port, safe_host_id, h->port,
+                        copy_text, display_host,
+                        display_port,
                         version_badges,
                         history_data,
-                        display, h->port, history_data,
+                        display_host, display_port, history_data,
                         overall_rate_int, // 背景层宽度
                         gradient_bg,      // 动态渐变背景
                         overall_rate_int, // 文字显示
@@ -1665,9 +2775,9 @@ void generate_html(char *buf, size_t bufsize)
                     "</table>\n"
                     "</div>\n"
                     "\n"
-                    "<div class='footer'>\n"  
-                    "© 2025 N2N Supernode Monitor · <a href='http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=GLULTq6IK_44qF_CAOSc4PqVLE_LMA6Y&authKey=KQ4hIgPoUa25xQF%%2FtFCNi%%2BuF31wob9vISoCpoOainpJ%%2Beo1AxRi%%2FZWmIImJbIZoH&noverify=0&group_code=196588661' target='_blank' rel='noopener noreferrer'>加入QQ群</a>\n"   
-                    "</div>\n"  
+                    "<div class='footer'>\n"
+                    "© 2025 N2N Supernode Monitor · <a href='http://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=GLULTq6IK_44qF_CAOSc4PqVLE_LMA6Y&authKey=KQ4hIgPoUa25xQF%%2FtFCNi%%2BuF31wob9vISoCpoOainpJ%%2Beo1AxRi%%2FZWmIImJbIZoH&noverify=0&group_code=196588661' target='_blank' rel='noopener noreferrer'>加入QQ群</a>\n"
+                    "</div>\n"
                     "\n"
                     "</div>\n"
                     "</body></html>\n");
@@ -1680,523 +2790,913 @@ void generate_html(char *buf, size_t bufsize)
     pthread_mutex_unlock(&g_state.lock);
 }
 
-void generate_svg_response(int client_sock, int is_online, float uptime,       
-                          int v1_ok, int v2_ok, int v2s_ok, int v3_ok) {    
-    if (verbose) {      
-        fprintf(stderr, "[%s] [DEBUG]: 开始生成 SVG 响应 (is_online=%d, uptime=%.2f%%, v1=%d, v2=%d, v2s=%d, v3=%d)\n",       
-                timestamp(), is_online, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);      
-    }          
-    char svg[4096];          
-    int len = 0;          
-              
-    // HTTP 头          
-    len += snprintf(svg + len, sizeof(svg) - len,          
-        "HTTP/1.1 200 OK\r\n"          
-        "Content-Type: image/svg+xml; charset=utf-8\r\n"          
-        "Connection: close\r\n\r\n");          
-          
-    // 计算文字宽度（近似值）      
-    const char *status_text = is_online ? "在线" : "离线";      
-    int status_label_width = 32;      
-    int status_value_width = 22;      
-    int uptime_label_width = 44;      
-    int uptime_value_width = uptime >= 100 ? 33 : (uptime >= 10 ? 28 : 23);     
-        
-    // 计算版本徽章宽度      
-    int version_label_width = 32;      
-    int version_count = v1_ok + v2_ok + v2s_ok + v3_ok;      
-    int version_value_width = 0;      
-    if (version_count > 0) {      
-        version_value_width = version_count * 22 + (version_count - 1) * 2;      
-    } else {      
-        version_value_width = 28;      
-    }    
+// 不区分大小写查找请求头  
+static char* find_header_value(const char *request, const char *header_name) {  
+    const char *p = request;  
+    size_t header_len = strlen(header_name);  
       
-    int badge_gap = 1;  // 徽章之间的间距  
-    int status_total = status_label_width + status_value_width + 16;      
-    int uptime_total = uptime >= 0 ? (uptime_label_width + uptime_value_width + 16) : 0;    
-    int version_total = version_label_width + version_value_width + 16;       
-    int total_width = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + version_total + badge_gap;     
-        
-    if (verbose) {    
-        fprintf(stderr, "[%s] [DEBUG]: SVG 尺寸: status=%d, uptime=%d, version=%d, total=%d\n",    
-                timestamp(), status_total, uptime_total, version_total, total_width);    
-    }    
-          
-    // SVG 内容          
-    len += snprintf(svg + len, sizeof(svg) - len,          
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"20\">\n",          
-        total_width);      
-            
-    // ========== 状态徽章（独立，左右圆角）==========  
-    const char *status_color = is_online ? "#4ade80" : "#ef4444";     
-        
-    if (verbose) {      
-        fprintf(stderr, "[%s] [DEBUG]: 状态徽章颜色: %s (状态文字: %s)\n",      
-                timestamp(), status_color, status_text);      
-    }     
-      
-    // 状态徽章 - 左侧部分（左边圆角，右边直角）  
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "  <path d=\"M 5 0 L %d 0 L %d 20 L 3 20 Q 0 20 0 17 L 0 3 Q 0 0 5 0 Z\" fill=\"#555\"/>\n",      
-        status_label_width + 8, status_label_width + 8);      
-          
-    // 状态徽章 - 右侧部分（左边直角，右边圆角）  
-    int status_right = status_total - 5;  
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",      
-        status_label_width + 8, status_right, status_total, status_total,  
-        status_total, status_total, status_right, status_label_width + 8, status_label_width + 8,  
-        status_color);      
-          
-    // 状态徽章文字      
-    int status_label_center = (status_label_width + 8) / 2;      
-    int status_value_center = status_label_width + 8 + (status_total - status_label_width - 8) / 2;      
-          
-    len += snprintf(svg + len, sizeof(svg) - len,          
-        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">状态</text>\n"          
-        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%s</text>\n",          
-        status_label_center,      
-        status_value_center,      
-        status_text);          
-              
-    // ========== 连通率徽章（独立，左右圆角）==========  
-    if (uptime >= 0) {        
-        int hue = 10 + (int)(uptime * 0.8);      
-        char uptime_color[32];        
-        snprintf(uptime_color, sizeof(uptime_color), "hsl(%d, 90%%, 50%%)", hue);      
-            
-        if (verbose) {      
-            fprintf(stderr, "[%s] [DEBUG]: 连通率徽章: uptime=%.2f%%, hue=%d, color=%s\n",      
-                    timestamp(), uptime, hue, uptime_color);      
-        }      
-              
-        int uptime_start = status_total + badge_gap;      
-        int uptime_mid = uptime_start + uptime_label_width + 8;      
-        int uptime_end = uptime_start + uptime_total;  
-              
-        // 连通率徽章 - 左侧部分（左边圆角，右边直角）  
-        len += snprintf(svg + len, sizeof(svg) - len,      
-            "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",      
-            uptime_start + 5, uptime_mid, uptime_mid, uptime_start + 5,  
-            uptime_start, uptime_start, uptime_start, uptime_start, uptime_start + 5);      
-              
-        // 连通率徽章 - 右侧部分（左边直角，右边圆角）  
-        int uptime_right = uptime_end - 5;  
-        len += snprintf(svg + len, sizeof(svg) - len,      
-            "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",      
-            uptime_mid, uptime_right, uptime_end, uptime_end,  
-            uptime_end, uptime_end, uptime_right, uptime_mid, uptime_mid,  
-            uptime_color);      
-              
-        // 连通率徽章文字    
-        int uptime_label_center = uptime_start + (uptime_mid - uptime_start) / 2;      
-        int uptime_value_center = uptime_mid + (uptime_end - uptime_mid) / 2;      
-              
-        len += snprintf(svg + len, sizeof(svg) - len,          
-            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">连通率</text>\n"          
-            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%.0f%%</text>\n",          
-            uptime_label_center,      
-            uptime_value_center,      
-            uptime);          
-    }          
-    if (is_online) {    
-    // ========== 版本徽章（独立，左右圆角）==========  
-    int version_start = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + badge_gap;      
-    int version_mid = version_start + version_label_width + 8;      
-    int version_end = version_start + version_total;      
-        
-    if (verbose) {    
-        fprintf(stderr, "[%s] [DEBUG]: 版本徽章位置: start=%d, mid=%d, end=%d\n",    
-                timestamp(), version_start, version_mid, version_end);    
-    }    
-         
-    // 版本徽章 - 左侧部分（左边圆角，右边直角）      
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",      
-        version_start + 5, version_mid, version_mid, version_start + 5,  
-        version_start, version_start, version_start, version_start, version_start + 5);   
-        
-    // 根据检测到的版本确定背景颜色  
-    const char *version_bg_color;  
-    if (version_count == 1) {  
-        // 只检测到一个版本，使用对应颜色  
-        if (v1_ok) {  
-            version_bg_color = "#7c3aed";  // v1 紫色  
-        } else if (v2_ok) {  
-            version_bg_color = "#0284c7";  // v2 深蓝色  
-        } else if (v2s_ok) {  
-            version_bg_color = "#0369a1";  // v2s 中蓝色  
-        } else {  // v3_ok  
-            version_bg_color = "#d97706";  // v3 橙色  
-        }  
-    } else if (version_count > 1) {  
-        // 检测到多个版本，使用红色  
-        version_bg_color = "#ef4444";  
-    } else {  
-        // 未检测到任何版本，使用红色  
-        version_bg_color = "#ef4444";  
-    }    
-          
-    // 版本徽章 - 右侧部分（左边直角，右边圆角）- 使用动态背景颜色  
-    int version_right = version_end - 5;    
-    len += snprintf(svg + len, sizeof(svg) - len,        
-        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",        
-            version_mid, version_right, version_end, version_end,        
-            version_end, version_end, version_right, version_mid, version_mid,  
-            version_bg_color);  // 使用动态颜色      
-          
-    // 版本徽章文字      
-    int version_label_center = version_start + (version_mid - version_start) / 2;      
-    len += snprintf(svg + len, sizeof(svg) - len,      
-        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">版本</text>\n",      
-    		version_label_center);      
-          
-    // 生成版本标签 
-    if (version_count > 0) {      
-        int x_offset = version_mid + 4;      
-          
-        if (v1_ok) {      
-            len += snprintf(svg + len, sizeof(svg) - len,      
-                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v1</text>\n",      
-            	 x_offset + 5);     
-            x_offset += 24;      
-        }      
-          
-        if (v2_ok) {      
-            len += snprintf(svg + len, sizeof(svg) - len,      
-                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2</text>\n",      
-            	 x_offset + 5);     
-            x_offset += 24;      
-        }      
-          
-        if (v2s_ok) {      
-            // v2s: 中蓝色背景 #0369a1  
-            len += snprintf(svg + len, sizeof(svg) - len,      
-                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2s</text>\n",      
-            	 x_offset + 6);      
-            x_offset += 28;      
-        }      
-          
-        if (v3_ok) {      
-            // v3: 橙色背景 #d97706  
-            len += snprintf(svg + len, sizeof(svg) - len,      
-                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v3</text>\n",      
-            	 x_offset + 5);     
-        }      
-    } else {      
-        // 未知版本：使用红色背景 #ef4444  
-        int version_value_center = version_mid + (version_value_width + 8) / 2;      
-        len += snprintf(svg + len, sizeof(svg) - len,      
-            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">未知</text>\n",      
-        	version_value_center);      
-    }        
-    }         
-    len += snprintf(svg + len, sizeof(svg) - len, "</svg>\n");    
-        
-    if (verbose) {      
-        fprintf(stderr, "[%s] [DEBUG]: SVG 生成完成，总长度: %d 字节\n", timestamp(), len);      
-    }          
-              
-    send(client_sock, svg, len, 0);          
-    close(client_sock);          
-}
-  
-void send_error_response(int client_sock, const char *message) {  
-    char response[512];  
-    int len = snprintf(response, sizeof(response),  
-        "HTTP/1.1 400 Bad Request\r\n"  
-        "Content-Type: text/plain; charset=utf-8\r\n"  
-        "Connection: close\r\n\r\n"  
-        "%s", message);  
-    send(client_sock, response, len, 0);  
-    close(client_sock);  
-}
-void handle_api_request(int client_sock, const char *path) {  
-    // 提取 supernode 参数  
-    char *query = strchr(path, '?');  
-    if (!query) {  
-        close(client_sock);  
-        return;  
-    }  
-      
-    char supernode[512] = {0};  
-    char *param = strstr(query, "supernode=");  
-    if (!param) {
-    	if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: API请求缺少查询参数\n", timestamp());  
-        }  
-        close(client_sock);  
-        return;  
-    }
-      
-    // 解析参数值  
-    sscanf(param + 10, "%511[^&]", supernode);  
-    if (strlen(supernode) == 0) {  
-    	if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: API请求 supernode 参数为空\n", timestamp());  
-        }
-        close(client_sock);  
-        return;  
-    }  
-       
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: API请求解析到 supernode 参数: %s\n", timestamp(), supernode);  
-    }
-     
-    // 尝试分离端口号  
-    char query_name[256] = {0};  
-    int user_port = 0;  // 用户提供的端口  
-    char *colon = strchr(supernode, ':');  
-    if (colon) {  
-        // 有冒号,提取冒号前的部分作为查询名称  
-        size_t name_len = colon - supernode;  
-        if (name_len < sizeof(query_name)) {  
-            strncpy(query_name, supernode, name_len);  
-            query_name[name_len] = '\0';  
-        }  
-        // 解析用户提供的端口  
-        user_port = atoi(colon + 1);  
-    } else {  
-        // 无冒号,整个字符串作为查询名称  
-        strncpy(query_name, supernode, sizeof(query_name) - 1);  
-    }  
-      
-    // 尝试匹配前端显示名称  
-    char actual_host[256] = {0};  
-    int actual_port = 0;  
-    int found = 0;  
-      
-    pthread_mutex_lock(&g_state.lock);  
-    for (int i = 0; i < g_state.host_count; i++) {  
-        if (g_state.hosts[i].display_name[0] &&   
-            strcmp(g_state.hosts[i].display_name, query_name) == 0) {  
-            strncpy(actual_host, g_state.hosts[i].host, sizeof(actual_host) - 1);  
-            // 关键修改: 如果用户提供了端口,使用用户端口;否则使用配置文件端口  
-            if (user_port > 0 && user_port <= 65535) {  
-                actual_port = user_port;  
-                if (verbose) {  
-                    fprintf(stderr, "[%s] [DEBUG]: API请求匹配到前端显示名称 '%s' -> %s:%d (使用用户提供的端口)\n",  
-                            timestamp(), query_name, actual_host, actual_port);  
-                }  
-            } else {  
-                actual_port = g_state.hosts[i].port;  
-                if (verbose) {  
-                    fprintf(stderr, "[%s] [DEBUG]: API请求匹配到前端显示名称 '%s' -> %s:%d (使用配置文件端口)\n",  
-                            timestamp(), query_name, actual_host, actual_port);  
-                }  
+    while (*p) {  
+        // 检查是否匹配请求头名称(不区分大小写)  
+        int match = 1;  
+        for (size_t i = 0; i < header_len; i++) {  
+            char c1 = tolower(p[i]);  
+            char c2 = tolower(header_name[i]);  
+            if (c1 != c2) {  
+                match = 0;  
+                break;  
             }  
-            found = 1;  
-            break;  
         }  
+          
+        if (match && p[header_len] == ':') {  
+            // 找到匹配的请求头,跳过冒号和空格  
+            const char *value = p + header_len + 1;  
+            while (*value == ' ') value++;  
+            return (char*)value;  
+        }  
+        p++;  
     }  
-    pthread_mutex_unlock(&g_state.lock);  
-      
-    // 如果未找到匹配的前端显示名称,按原格式解析 host:port  
-    if (!found) {  
-        if (sscanf(supernode, "%255[^:]:%d", actual_host, &actual_port) != 2 ||  
-            actual_port <= 0 || actual_port > 65535) {  
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: API请求 supernode 参数值格式错误: %s\n",   
-                        timestamp(), supernode);  
-            }  
-            send_error_response(client_sock, "格式错误,正确格式: host:port 或前端显示主机名[:port]");  
-            return;  
-        }  
-        if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: API请求解析为 host:port 格式: %s:%d\n",  
-                    timestamp(), actual_host, actual_port);  
-        }  
-    } 
-      
-    // 执行检测  
-    int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;  
-    int result = test_supernode_internal(actual_host, actual_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok); 
-    
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: API请求 %s:%d 检测结果: result=%d, v1=%d, v2=%d, v2s=%d, v3=%d\n",  
-                timestamp(), actual_host, actual_port, result, v1_ok, v2_ok, v2s_ok, v3_ok);  
-    } 
-      
-    // 检查历史记录  
-    float uptime = -1.0f;  
-    pthread_mutex_lock(&g_state.lock);  
-    for (int i = 0; i < g_state.host_count; i++) {  
-        if (strcmp(g_state.hosts[i].host, actual_host) == 0 &&   
-            g_state.hosts[i].port == actual_port) {  
-            uptime = calculate_uptime(&g_state.hosts[i]);
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: API请求 %s:%d 找到历史记录: uptime=%.2f%%\n", timestamp(), actual_host, actual_port, uptime);  
-            }  
-            break;  
-        }  
-    }  
-    pthread_mutex_unlock(&g_state.lock);  
-      
-    // 生成 SVG 响应  
-    generate_svg_response(client_sock, result == 0, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);  
+    return NULL;  
 }
 
-void handle_refresh_request(int client_sock) {      
-    time_t now = time(NULL);      
-    pthread_mutex_lock(&g_state.lock);      
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 收到刷新请求 - now=%ld, last_manual_refresh=%ld, 间隔=%d秒, 差值=%ld秒\n",  
-                timestamp(), now, last_manual_refresh, manual_refresh_interval * 60, now - last_manual_refresh);  
-    }  
-          
-    if (now - last_manual_refresh < manual_refresh_interval * 60) {      
-        pthread_mutex_unlock(&g_state.lock);      
-          
-        if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: 刷新间隔未到,拒绝请求\n", timestamp());  
-        }  
-          
-        char response[512];      
-        int len = snprintf(response, sizeof(response),      
-            "HTTP/1.1 200 OK\r\n"      
-            "Content-Type: application/json; charset=utf-8\r\n"      
-            "Connection: close\r\n\r\n"      
-            "{\"success\":false,\"message\":\"哎呀，才刚刚检测过呢,等等再试哦~\"}");      
-        send(client_sock, response, len, 0);      
-        close(client_sock);      
-        return;      
-    }      
-          
-    last_manual_refresh = now;  
-    pthread_mutex_unlock(&g_state.lock);  
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 开始执行刷新,检测 %d 个主机\n", timestamp(), g_state.host_count);  
-    }  
-          
-    // 执行检测逻辑  
-    for (int i = 0; i < g_state.host_count; i++) {      
-        host_stats_t *h = &g_state.hosts[i];      
-        int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;      
-        
-        test_supernode_internal(h->host, h->port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);      
-              
-        pthread_mutex_lock(&g_state.lock);      
-        h->total_checks++;      
-        if (v1_ok) h->success_v1++;      
-        if (v2_ok) h->success_v2++;      
-        if (v2s_ok) h->success_v2s++;      
-        if (v3_ok) h->success_v3++;      
-        h->last_check = time(NULL);      
-              
-        int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);      
-        add_check_record(h, is_online);      
-        snprintf(h->last_status, sizeof(h->last_status),       
-                 is_online ? "✓ 在线" : "✗ 离线");      
-        save_history(h);  // 确保数据已保存  
-        pthread_mutex_unlock(&g_state.lock);      
-    }      
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [DEBUG]: 刷新完成,发送成功响应\n", timestamp());  
-    }  
-      
-    // 所有检测完成后才发送响应  
-    char response[512];      
-    int len = snprintf(response, sizeof(response),      
-        "HTTP/1.1 200 OK\r\n"      
-        "Content-Type: application/json; charset=utf-8\r\n"      
-        "Connection: close\r\n\r\n"      
-        "{\"success\":true,\"message\":\"刷新成功\"}");      
-    send(client_sock, response, len, 0);      
-    close(client_sock);      
+void generate_svg_response(int client_sock, int is_online, float uptime,
+                           int v1_ok, int v2_ok, int v2s_ok, int v3_ok)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始生成 SVG 响应 (is_online=%d, uptime=%.2f%%, v1=%d, v2=%d, v2s=%d, v3=%d)\n",
+                timestamp(), is_online, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);
+    }
+    char svg[4096];
+    int len = 0;
+
+    // HTTP 头
+    len += snprintf(svg + len, sizeof(svg) - len,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: image/svg+xml; charset=utf-8\r\n"
+                    "Connection: close\r\n\r\n");
+
+    // 计算文字宽度（近似值）
+    const char *status_text = is_online ? "在线" : "离线";
+    int status_label_width = 32;
+    int status_value_width = 22;
+    int uptime_label_width = 44;
+    int uptime_value_width = uptime >= 100 ? 33 : (uptime >= 10 ? 28 : 23);
+
+    // 计算版本徽章宽度
+    int version_label_width = 32;
+    int version_count = v1_ok + v2_ok + v2s_ok + v3_ok;
+    int version_value_width = 0;
+    if (version_count > 0)
+    {
+        version_value_width = version_count * 22 + (version_count - 1) * 2;
+    }
+    else
+    {
+        version_value_width = 28;
+    }
+
+    int badge_gap = 1; // 徽章之间的间距
+    int status_total = status_label_width + status_value_width + 16;
+    int uptime_total = uptime >= 0 ? (uptime_label_width + uptime_value_width + 16) : 0;
+    int version_total = version_label_width + version_value_width + 16;
+    int total_width = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + version_total + badge_gap;
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: SVG 尺寸: status=%d, uptime=%d, version=%d, total=%d\n",
+                timestamp(), status_total, uptime_total, version_total, total_width);
+    }
+
+    // SVG 内容
+    len += snprintf(svg + len, sizeof(svg) - len,
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"%d\" height=\"20\">\n",
+                    total_width);
+
+    // ========== 状态徽章（独立，左右圆角）==========
+    const char *status_color = is_online ? "#4ade80" : "#ef4444";
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 状态徽章颜色: %s (状态文字: %s)\n",
+                timestamp(), status_color, status_text);
+    }
+
+    // 状态徽章 - 左侧部分（左边圆角，右边直角）
+    len += snprintf(svg + len, sizeof(svg) - len,
+                    "  <path d=\"M 5 0 L %d 0 L %d 20 L 3 20 Q 0 20 0 17 L 0 3 Q 0 0 5 0 Z\" fill=\"#555\"/>\n",
+                    status_label_width + 8, status_label_width + 8);
+
+    // 状态徽章 - 右侧部分（左边直角，右边圆角）
+    int status_right = status_total - 5;
+    len += snprintf(svg + len, sizeof(svg) - len,
+                    "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",
+                    status_label_width + 8, status_right, status_total, status_total,
+                    status_total, status_total, status_right, status_label_width + 8, status_label_width + 8,
+                    status_color);
+
+    // 状态徽章文字
+    int status_label_center = (status_label_width + 8) / 2;
+    int status_value_center = status_label_width + 8 + (status_total - status_label_width - 8) / 2;
+
+    len += snprintf(svg + len, sizeof(svg) - len,
+                    "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">状态</text>\n"
+                    "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%s</text>\n",
+                    status_label_center,
+                    status_value_center,
+                    status_text);
+
+    // ========== 连通率徽章（独立，左右圆角）==========
+    if (uptime >= 0)
+    {
+        int hue = 10 + (int)(uptime * 0.8);
+        char uptime_color[32];
+        snprintf(uptime_color, sizeof(uptime_color), "hsl(%d, 90%%, 50%%)", hue);
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 连通率徽章: uptime=%.2f%%, hue=%d, color=%s\n",
+                    timestamp(), uptime, hue, uptime_color);
+        }
+
+        int uptime_start = status_total + badge_gap;
+        int uptime_mid = uptime_start + uptime_label_width + 8;
+        int uptime_end = uptime_start + uptime_total;
+
+        // 连通率徽章 - 左侧部分（左边圆角，右边直角）
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",
+                        uptime_start + 5, uptime_mid, uptime_mid, uptime_start + 5,
+                        uptime_start, uptime_start, uptime_start, uptime_start, uptime_start + 5);
+
+        // 连通率徽章 - 右侧部分（左边直角，右边圆角）
+        int uptime_right = uptime_end - 5;
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",
+                        uptime_mid, uptime_right, uptime_end, uptime_end,
+                        uptime_end, uptime_end, uptime_right, uptime_mid, uptime_mid,
+                        uptime_color);
+
+        // 连通率徽章文字
+        int uptime_label_center = uptime_start + (uptime_mid - uptime_start) / 2;
+        int uptime_value_center = uptime_mid + (uptime_end - uptime_mid) / 2;
+
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">连通率</text>\n"
+                        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">%.0f%%</text>\n",
+                        uptime_label_center,
+                        uptime_value_center,
+                        uptime);
+    }
+    if (is_online)
+    {
+        // ========== 版本徽章（独立，左右圆角）==========
+        int version_start = status_total + (uptime_total > 0 ? uptime_total + badge_gap : 0) + badge_gap;
+        int version_mid = version_start + version_label_width + 8;
+        int version_end = version_start + version_total;
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 版本徽章位置: start=%d, mid=%d, end=%d\n",
+                    timestamp(), version_start, version_mid, version_end);
+        }
+
+        // 版本徽章 - 左侧部分（左边圆角，右边直角）
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <path d=\"M %d 0 L %d 0 L %d 20 L %d 20 Q %d 20 %d 17 L %d 3 Q %d 0 %d 0 Z\" fill=\"#555\"/>\n",
+                        version_start + 5, version_mid, version_mid, version_start + 5,
+                        version_start, version_start, version_start, version_start, version_start + 5);
+
+        // 根据检测到的版本确定背景颜色
+        const char *version_bg_color;
+        if (version_count == 1)
+        {
+            // 只检测到一个版本，使用对应颜色
+            if (v1_ok)
+            {
+                version_bg_color = "#7c3aed"; // v1 紫色
+            }
+            else if (v2_ok)
+            {
+                version_bg_color = "#0284c7"; // v2 深蓝色
+            }
+            else if (v2s_ok)
+            {
+                version_bg_color = "#0369a1"; // v2s 中蓝色
+            }
+            else
+            {                                 // v3_ok
+                version_bg_color = "#d97706"; // v3 橙色
+            }
+        }
+        else if (version_count > 1)
+        {
+            // 检测到多个版本，使用红色
+            version_bg_color = "#ef4444";
+        }
+        else
+        {
+            // 未检测到任何版本，使用红色
+            version_bg_color = "#ef4444";
+        }
+
+        // 版本徽章 - 右侧部分（左边直角，右边圆角）- 使用动态背景颜色
+        int version_right = version_end - 5;
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <path d=\"M %d 0 L %d 0 Q %d 0 %d 3 L %d 17 Q %d 20 %d 20 L %d 20 L %d 0 Z\" fill=\"%s\"/>\n",
+                        version_mid, version_right, version_end, version_end,
+                        version_end, version_end, version_right, version_mid, version_mid,
+                        version_bg_color); // 使用动态颜色
+
+        // 版本徽章文字
+        int version_label_center = version_start + (version_mid - version_start) / 2;
+        len += snprintf(svg + len, sizeof(svg) - len,
+                        "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">版本</text>\n",
+                        version_label_center);
+
+        // 生成版本标签
+        if (version_count > 0)
+        {
+            int x_offset = version_mid + 4;
+
+            if (v1_ok)
+            {
+                len += snprintf(svg + len, sizeof(svg) - len,
+                                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v1</text>\n",
+                                x_offset + 5);
+                x_offset += 24;
+            }
+
+            if (v2_ok)
+            {
+                len += snprintf(svg + len, sizeof(svg) - len,
+                                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2</text>\n",
+                                x_offset + 5);
+                x_offset += 24;
+            }
+
+            if (v2s_ok)
+            {
+                // v2s: 中蓝色背景 #0369a1
+                len += snprintf(svg + len, sizeof(svg) - len,
+                                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v2s</text>\n",
+                                x_offset + 6);
+                x_offset += 28;
+            }
+
+            if (v3_ok)
+            {
+                // v3: 橙色背景 #d97706
+                len += snprintf(svg + len, sizeof(svg) - len,
+                                "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"10\" font-weight=\"600\">v3</text>\n",
+                                x_offset + 5);
+            }
+        }
+        else
+        {
+            // 未知版本：使用红色背景 #ef4444
+            int version_value_center = version_mid + (version_value_width + 8) / 2;
+            len += snprintf(svg + len, sizeof(svg) - len,
+                            "  <text x=\"%d\" y=\"14\" fill=\"#fff\" font-size=\"11\" text-anchor=\"middle\">未知</text>\n",
+                            version_value_center);
+        }
+    }
+    len += snprintf(svg + len, sizeof(svg) - len, "</svg>\n");
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: SVG 生成完成，总长度: %d 字节\n", timestamp(), len);
+    }
+
+    send(client_sock, svg, len, 0);
+    close(client_sock);
+}
+
+void send_error_response(int client_sock, const char *message)
+{
+    char response[512];
+    int len = snprintf(response, sizeof(response),
+                       "HTTP/1.1 400 Bad Request\r\n"
+                       "Content-Type: text/plain; charset=utf-8\r\n"
+                       "Connection: close\r\n\r\n"
+                       "%s",
+                       message);
+    send(client_sock, response, len, 0);
+    close(client_sock);
+}
+void handle_api_request(int client_sock, const char *path)
+{
+    // 提取 supernode 参数
+    char *query = strchr(path, '?');
+    if (!query)
+    {
+        close(client_sock);
+        return;
+    }
+
+    char supernode[512] = {0};
+    char *param = strstr(query, "supernode=");
+    if (!param)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: API请求缺少查询参数\n", timestamp());
+        }
+        close(client_sock);
+        return;
+    }
+
+    // 解析参数值
+    sscanf(param + 10, "%511[^&]", supernode);
+    if (strlen(supernode) == 0)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: API请求 supernode 参数为空\n", timestamp());
+        }
+        close(client_sock);
+        return;
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: API请求解析到 supernode 参数: %s\n", timestamp(), supernode);
+    }
+
+    // 先检测特殊前缀
+    int has_special_prefix = 0;
+    if (strncmp(supernode, "txt:", 4) == 0 || strncmp(supernode, "http:", 5) == 0)
+    {
+        has_special_prefix = 1;
+    }
+    // 尝试分离端口号
+    char query_name[256] = {0};
+    int user_port = 0; // 用户提供的端口
+
+    if (has_special_prefix)
+    {
+        // 对于特殊前缀,跳过前缀后再查找冒号
+        const char *host_part = (strncmp(supernode, "txt:", 4) == 0) ? supernode + 4 : supernode + 5;
+
+        // 对于 http: 前缀,需要先查找路径分隔符
+        if (strncmp(supernode, "http:", 5) == 0)
+        {
+            char *slash = strchr(host_part, '/');
+
+            if (slash)
+            {
+                // 有路径,在路径之前查找端口
+                char temp_host[256];
+                size_t host_len = slash - host_part;
+                strncpy(temp_host, host_part, host_len);
+                temp_host[host_len] = '\0';
+
+                char *temp_colon = strchr(temp_host, ':');
+                if (temp_colon)
+                {
+                    // 提取主机名和端口
+                    size_t prefix_len = host_part - supernode;
+                    size_t name_len = prefix_len + (temp_colon - temp_host);
+                    strncpy(query_name, supernode, name_len);
+                    query_name[name_len] = '\0';
+
+                    // 对于带路径的 http: 前缀，端口应该设为 0 以匹配配置文件
+                    user_port = 0; // 修改这里，不再提取端口
+                }
+                else
+                {
+                    // 没有端口,只有路径
+                    strncpy(query_name, supernode, sizeof(query_name) - 1);
+                    user_port = 0;
+                }
+            }
+            else
+            {
+                // 没有路径,正常处理
+                char *colon = strchr(host_part, ':');
+                if (colon)
+                {
+                    size_t prefix_len = host_part - supernode;
+                    size_t name_len = prefix_len + (colon - host_part);
+                    strncpy(query_name, supernode, name_len);
+                    query_name[name_len] = '\0';
+                    user_port = atoi(colon + 1);
+                }
+                else
+                {
+                    strncpy(query_name, supernode, sizeof(query_name) - 1);
+                    user_port = 0;
+                }
+            }
+        }
+        else
+        {
+            // txt: 前缀,原有逻辑
+            char *colon = strchr(host_part, ':');
+            if (colon)
+            {
+                size_t prefix_len = host_part - supernode;
+                size_t name_len = prefix_len + (colon - host_part);
+                strncpy(query_name, supernode, name_len);
+                query_name[name_len] = '\0';
+                user_port = atoi(colon + 1);
+            }
+            else
+            {
+                strncpy(query_name, supernode, sizeof(query_name) - 1);
+                user_port = 0;
+            }
+        }
+    }
+
+    // 尝试匹配前端显示名称
+    char actual_host[256] = {0};
+    int actual_port = 0;
+    int found = 0;
+
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < g_state.host_count; i++)
+    {
+        if (g_state.hosts[i].display_name[0] &&
+            strcmp(g_state.hosts[i].display_name, query_name) == 0)
+        {
+            strncpy(actual_host, g_state.hosts[i].host, sizeof(actual_host) - 1);
+            // 关键修改: 如果用户提供了端口,使用用户端口;否则使用配置文件端口
+            if (user_port > 0 && user_port <= 65535)
+            {
+                actual_port = user_port;
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: API请求匹配到前端显示名称 '%s' -> %s:%d (使用用户提供的端口)\n",
+                            timestamp(), query_name, actual_host, actual_port);
+                }
+            }
+            else
+            {
+                actual_port = g_state.hosts[i].port;
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: API请求匹配到前端显示名称 '%s' -> %s:%d (使用配置文件端口)\n",
+                            timestamp(), query_name, actual_host, actual_port);
+                }
+            }
+            found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+
+    // 如果未找到匹配的前端显示名称,按原格式解析 host:port
+    if (!found)
+    {
+        // 检查是否有特殊前缀
+        if (strncmp(supernode, "txt:", 4) == 0 || strncmp(supernode, "http:", 5) == 0)
+        {
+            // 特殊前缀，直接使用 supernode 作为 actual_host
+            strncpy(actual_host, supernode, sizeof(actual_host) - 1);
+            actual_host[sizeof(actual_host) - 1] = '\0';
+
+            // 对于 http: 前缀，检查是否有路径
+            if (strncmp(supernode, "http:", 5) == 0)
+            {
+                const char *host_part = supernode + 5;
+                char *slash = strchr(host_part, '/');
+
+                if (slash)
+                {
+                    // 有路径，端口设为 0（与配置文件解析逻辑一致）
+                    actual_port = 0;
+                }
+                else
+                {
+                    // 没有路径，正常提取端口
+                    char *colon = strchr(host_part, ':');
+                    if (colon)
+                    {
+                        actual_port = atoi(colon + 1);
+                    }
+                    else
+                    {
+                        actual_port = 0;
+                    }
+                }
+            }
+            else
+            {
+                // txt: 前缀，正常提取端口
+                const char *host_part = supernode + 4;
+                char *colon = strchr(host_part, ':');
+                if (colon)
+                {
+                    actual_port = atoi(colon + 1);
+                }
+                else
+                {
+                    actual_port = 0;
+                }
+            }
+        }
+        else
+        {
+            // 普通主机，必须有有效端口
+            if (sscanf(supernode, "%255[^:]:%d", actual_host, &actual_port) != 2 ||
+                actual_port <= 0 || actual_port > 65535)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: API请求 supernode 参数值格式错误: %s\n",
+                            timestamp(), supernode);
+                }
+                send_error_response(client_sock, "格式错误,正确格式: host:port 或前端显示主机名[:port]");
+                return;
+            }
+        }
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: API请求解析为 host:port 格式: %s:%d\n",
+                    timestamp(), actual_host, actual_port);
+        }
+    }
+    // 解析真实的 IP 和端口
+    char real_host[256];
+    int real_port;
+
+    // 检查是否有特殊前缀
+    if (strncmp(actual_host, "txt:", 4) == 0)
+    {
+        // TXT 记录解析
+        if (resolve_txt_record(actual_host, real_host, &real_port) != 0)
+        {
+            // 解析失败
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: API请求 TXT 解析失败: %s\n",
+                        timestamp(), actual_host);
+            }
+            send_error_response(client_sock, "✗ TXT解析失败");
+            return;
+        }
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: API请求 TXT 解析: %s -> %s:%d\n",
+                    timestamp(), actual_host, real_host, real_port);
+        }
+    }
+    else if (strncmp(actual_host, "http:", 5) == 0)
+    {
+        // HTTP 重定向解析
+        if (resolve_http_redirect(actual_host, actual_port, real_host, &real_port) != 0)
+        {
+            // 解析失败
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: API请求 HTTP 解析失败: %s\n",
+                        timestamp(), actual_host);
+            }
+            send_error_response(client_sock, "✗ HTTP解析失败");
+            return;
+        }
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: API请求 HTTP 解析: %s -> %s:%d\n",
+                    timestamp(), actual_host, real_host, real_port);
+        }
+    }
+    else
+    {
+        // 普通主机，直接使用
+        strncpy(real_host, actual_host, sizeof(real_host) - 1);
+        real_host[sizeof(real_host) - 1] = '\0';
+        real_port = actual_port;
+    }
+    // 执行检测
+    int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;
+    int result = test_supernode_internal(real_host, real_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: API请求 %s:%d 检测结果: result=%d, v1=%d, v2=%d, v2s=%d, v3=%d\n",
+                timestamp(), actual_host, actual_port, result, v1_ok, v2_ok, v2s_ok, v3_ok);
+    }
+
+    // 检查历史记录
+    float uptime = -1.0f;
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < g_state.host_count; i++)
+    {
+        if (strcmp(g_state.hosts[i].host, actual_host) == 0 &&
+            g_state.hosts[i].port == actual_port)
+        {
+            uptime = calculate_uptime(&g_state.hosts[i]);
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: API请求 %s:%d 找到历史记录: uptime=%.2f%%\n", timestamp(), actual_host, actual_port, uptime);
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_state.lock);
+
+    // 生成 SVG 响应
+    generate_svg_response(client_sock, result == 0, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);
+}
+
+void handle_refresh_request(int client_sock)
+{
+    time_t now = time(NULL);
+    pthread_mutex_lock(&g_state.lock);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 收到刷新请求 - now=%ld, last_manual_refresh=%ld, 间隔=%d秒, 差值=%ld秒\n",
+                timestamp(), now, last_manual_refresh, manual_refresh_interval * 60, now - last_manual_refresh);
+    }
+
+    if (now - last_manual_refresh < manual_refresh_interval * 60)
+    {
+        pthread_mutex_unlock(&g_state.lock);
+
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 刷新间隔未到,拒绝请求\n", timestamp());
+        }
+
+        char response[512];
+        int len = snprintf(response, sizeof(response),
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: application/json; charset=utf-8\r\n"
+                           "Connection: close\r\n\r\n"
+                           "{\"success\":false,\"message\":\"哎呀，才刚刚检测过呢,等等再试哦~\"}");
+        send(client_sock, response, len, 0);
+        close(client_sock);
+        return;
+    }
+
+    last_manual_refresh = now;
+    pthread_mutex_unlock(&g_state.lock);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始执行刷新,检测 %d 个主机\n", timestamp(), g_state.host_count);
+    }
+
+    // 执行检测逻辑
+    for (int i = 0; i < g_state.host_count; i++)
+    {
+        host_stats_t *h = &g_state.hosts[i];
+        int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;
+
+        // 解析真实的 IP 和端口
+        char real_host[256];
+        int real_port;
+        int resolve_failed = 0;
+
+        if (strncmp(h->host, "txt:", 4) == 0)
+        {
+            // TXT 记录解析
+            if (resolve_txt_record(h->host, real_host, &real_port) == 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: TXT 解析: %s -> %s:%d\n",
+                            timestamp(), h->host, real_host, real_port);
+                }
+            }
+            else
+            {
+                // 解析失败，标记但继续正常流程
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: TXT 解析失败: %s\n", timestamp(), h->host);
+                }
+                resolve_failed = 1;
+            }
+        }
+        else if (strncmp(h->host, "http:", 5) == 0)
+        {
+            // HTTP 重定向解析
+            if (resolve_http_redirect(h->host, h->port, real_host, &real_port) == 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: HTTP 解析: %s -> %s:%d\n",
+                            timestamp(), h->host, real_host, real_port);
+                }
+            }
+            else
+            {
+                // 解析失败，标记但继续正常流程
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: HTTP 解析失败: %s\n", timestamp(), h->host);
+                }
+                resolve_failed = 1;
+            }
+        }
+        else
+        {
+            // 普通主机，直接使用原始地址
+            strncpy(real_host, h->host, sizeof(real_host) - 1);
+            real_host[sizeof(real_host) - 1] = '\0';
+            real_port = h->port;
+        }
+
+        if (!resolve_failed)
+        {
+            test_supernode_internal(real_host, real_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
+        }
+
+        pthread_mutex_lock(&g_state.lock);
+        h->total_checks++;
+        if (v1_ok)
+            h->success_v1++;
+        if (v2_ok)
+            h->success_v2++;
+        if (v2s_ok)
+            h->success_v2s++;
+        if (v3_ok)
+            h->success_v3++;
+        h->last_check = time(NULL);
+
+        int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);
+        add_check_record(h, is_online);
+        snprintf(h->last_status, sizeof(h->last_status),
+                 is_online ? "✓ 在线" : "✗ 离线");
+        save_history(h); // 确保数据已保存
+        pthread_mutex_unlock(&g_state.lock);
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 刷新完成,发送成功响应\n", timestamp());
+    }
+
+    // 所有检测完成后才发送响应
+    char response[512];
+    int len = snprintf(response, sizeof(response),
+                       "HTTP/1.1 200 OK\r\n"
+                       "Content-Type: application/json; charset=utf-8\r\n"
+                       "Connection: close\r\n\r\n"
+                       "{\"success\":true,\"message\":\"刷新成功\"}");
+    send(client_sock, response, len, 0);
+    close(client_sock);
 }
 
 // HTTP 请求处理
-void handle_http_request(int client_sock)  
-{  
-    if (verbose)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: 开始处理 HTTP 请求 (socket fd=%d)\n", timestamp(), client_sock);  
-    }  
-    char request[1024];  
-    ssize_t n = recv(client_sock, request, sizeof(request) - 1, 0);  
-    if (verbose)  
-    {  
-        fprintf(stderr, "[%s] [DEBUG]: 接收到 %zd 字节请求数据\n", timestamp(), n);  
-    }  
-      
-    if (n > 0) {  
-        request[n] = '\0';  
+void handle_http_request(int client_sock)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始处理 HTTP 请求 (socket fd=%d)\n", timestamp(), client_sock);
+    }
+    char request[1024];
+    ssize_t n = recv(client_sock, request, sizeof(request) - 1, 0);
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 接收到 %zd 字节请求数据\n", timestamp(), n);
+    }
+
+    if (n > 0)
+    {
+        request[n] = '\0';
+        
+        //fprintf(stderr, "[%s] [DEBUG]: 请求头： %s \n", timestamp(), request);
+        
+        // 查找代理请求头  
+        char *xff = find_header_value(request, "X-Forwarded-For");  
+        char *xri = find_header_value(request, "X-Real-IP");  
+        char *cfip = find_header_value(request, "CF-Connecting-IP");  
           
-        // 解析请求行: GET /api?supernode=host:port HTTP/1.1    
-        char method[16], path[512], version[16];    
-        if (sscanf(request, "%15s %511s %15s", method, path, version) == 3) {  
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: 解析请求: method=%s, path=%s, version=%s\n",  
-                        timestamp(), method, path, version);  
+        // 构建合并的消息  
+        char proxy_info[1024] = {0};  
+        int has_proxy_header = 0;  
+          
+        if (xff || xri || cfip) {  
+            strcat(proxy_info, "代理信息: ");  
+              
+            if (xff) {  
+                char xff_value[256];  
+                sscanf(xff, "%255[^\r\n]", xff_value);  
+                strcat(proxy_info, "X-Forwarded-For=");  
+                strcat(proxy_info, xff_value);  
+                has_proxy_header = 1;  
             }  
               
-            if (strncmp(path, "/api", 4) == 0) {  
-                if (verbose) {  
-                    fprintf(stderr, "[%s] [DEBUG]: 识别为 API 请求，转发到 handle_api_request()\n", timestamp());  
-                }  
-                handle_api_request(client_sock, path);    
-                return;    
-            }
-            
-            if (strncmp(path, "/refresh", 8) == 0) { 
-            	if (verbose) {  
-                    fprintf(stderr, "[%s] [DEBUG]: 识别为 立即刷新 请求，转发到 handle_refresh_request()\n", timestamp());  
-                }  
-    		handle_refresh_request(client_sock);  
-    		return;  
-	    }  
+            if (xri) {  
+                char xri_value[256];  
+                sscanf(xri, "%255[^\r\n]", xri_value);  
+                if (has_proxy_header) strcat(proxy_info, ", ");  
+                strcat(proxy_info, "X-Real-IP=");  
+                strcat(proxy_info, xri_value);  
+                has_proxy_header = 1;  
+            }  
               
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: 识别为主页请求，生成 HTML 响应\n", timestamp());  
+            if (cfip) {  
+                char cfip_value[256];  
+                sscanf(cfip, "%255[^\r\n]", cfip_value);  
+                if (has_proxy_header) strcat(proxy_info, ", ");  
+                strcat(proxy_info, "CF-Connecting-IP=");  
+                strcat(proxy_info, cfip_value);  
             }  
-        } else {  
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: 请求行解析失败\n", timestamp());  
-            }  
+              
+            // 输出合并后的消息  
+            fprintf(stderr, "[%s] [DEBUG]: %s\n", timestamp(), proxy_info);  
         }  
-               
-        char *response = malloc(262144);  // 256KB      
-        if (response) {  
-            if (verbose) {  
-                fprintf(stderr, "[%s] [DEBUG]: 开始生成 HTML 内容\n", timestamp());  
-            }  
-              
-            generate_html(response, 262144);      
-            size_t response_len = strlen(response);    
-            ssize_t sent = send(client_sock, response, response_len, 0);  
-              
-            if (verbose) {    
-                fprintf(stderr, "[%s] [DEBUG]: 发送响应: %zd/%zu 字节\n", timestamp(), sent, response_len);    
-            }      
-            free(response);      
-        } else {    
-            if (verbose) {    
-                fprintf(stderr, "[%s] [ERROR]: 响应缓冲区分配失败\n", timestamp());    
-            }    
-        }     
-    } else if (n == 0) {    
-        if (verbose) {    
-            fprintf(stderr, "[%s] [DEBUG]: 客户端关闭连接\n", timestamp());    
-        }    
-    } else {    
-        if (verbose) {    
-            fprintf(stderr, "[%s] [ERROR]: recv() 错误: %s\n", timestamp(), strerror(errno));    
-        }    
-    }     
-          
-    close(client_sock);   
-    if (verbose) {    
-        fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());    
-    }     
+
+        // 解析请求行: GET /api?supernode=host:port HTTP/1.1
+        char method[16], path[512], version[16];
+        if (sscanf(request, "%15s %511s %15s", method, path, version) == 3)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 解析请求: method=%s, path=%s, version=%s\n",
+                        timestamp(), method, path, version);
+            }
+
+            if (strncmp(path, "/api", 4) == 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 识别为 API 请求，转发到 handle_api_request()\n", timestamp());
+                }
+                handle_api_request(client_sock, path);
+                return;
+            }
+
+            if (strncmp(path, "/refresh", 8) == 0)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 识别为 立即刷新 请求，转发到 handle_refresh_request()\n", timestamp());
+                }
+                handle_refresh_request(client_sock);
+                return;
+            }
+
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 识别为主页请求，生成 HTML 响应\n", timestamp());
+            }
+        }
+        else
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 请求行解析失败\n", timestamp());
+            }
+        }
+
+        char *response = malloc(262144); // 256KB
+        if (response)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 开始生成 HTML 内容\n", timestamp());
+            }
+
+            generate_html(response, 262144);
+            size_t response_len = strlen(response);
+            ssize_t sent = send(client_sock, response, response_len, 0);
+
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 发送响应: %zd/%zu 字节\n", timestamp(), sent, response_len);
+            }
+            free(response);
+        }
+        else
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 响应缓冲区分配失败\n", timestamp());
+            }
+        }
+    }
+    else if (n == 0)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 客户端关闭连接\n", timestamp());
+        }
+    }
+    else
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [ERROR]: recv() 错误: %s\n", timestamp(), strerror(errno));
+        }
+    }
+
+    close(client_sock);
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());
+    }
 }
 
 // 监控线程
 void *monitor_thread(void *arg)
 {
+    (void)arg;
     if (verbose)
     {
         fprintf(stderr, "[%s] [DEBUG]: 监控线程启动\n", timestamp());
@@ -2206,31 +3706,36 @@ void *monitor_thread(void *arg)
     {
         round++;
 
-		// 检查配置文件是否被修改  
-        if (g_state.config_file_path[0] != '\0') {  
-            struct stat st;  
-            if (stat(g_state.config_file_path, &st) == 0) {  
-                if (st.st_mtime > g_state.config_mtime) {  
-                   	// 转换旧时间  
-    			struct tm *old_tm = localtime(&g_state.config_mtime);  
-    			char old_time_str[64];  
-    			strftime(old_time_str, sizeof(old_time_str), "%Y年%m月%d日 %H时%M分%S秒", old_tm);  
-      
-    			// 转换新时间  
-    			struct tm *new_tm = localtime(&st.st_mtime);  
-    			char new_time_str[64];  
-    			strftime(new_time_str, sizeof(new_time_str), "%Y年%m月%d日 %H时%M分%S秒", new_tm);  
-      
-    			fprintf(stderr, "[%s] [DEBUG]: 配置文件已修改 (上次是%s, 当前为%s)重新加载\n",  
-            			timestamp(), old_time_str, new_time_str);  
-      
-    			g_state.config_mtime = st.st_mtime;  
-    			reload_config();  
-                }  
-            } else if (verbose) {  
-                fprintf(stderr, "[%s] [WARN]: 无法访问配置文件: %s\n",  
-                        timestamp(), strerror(errno));  
-            }  
+        // 检查配置文件是否被修改
+        if (g_state.config_file_path[0] != '\0')
+        {
+            struct stat st;
+            if (stat(g_state.config_file_path, &st) == 0)
+            {
+                if (st.st_mtime > g_state.config_mtime)
+                {
+                    // 转换旧时间
+                    struct tm *old_tm = localtime(&g_state.config_mtime);
+                    char old_time_str[64];
+                    strftime(old_time_str, sizeof(old_time_str), "%Y年%m月%d日 %H时%M分%S秒", old_tm);
+
+                    // 转换新时间
+                    struct tm *new_tm = localtime(&st.st_mtime);
+                    char new_time_str[64];
+                    strftime(new_time_str, sizeof(new_time_str), "%Y年%m月%d日 %H时%M分%S秒", new_tm);
+
+                    fprintf(stderr, "[%s] [DEBUG]: 配置文件已修改 (上次是%s, 当前为%s)重新加载\n",
+                            timestamp(), old_time_str, new_time_str);
+
+                    g_state.config_mtime = st.st_mtime;
+                    reload_config();
+                }
+            }
+            else if (verbose)
+            {
+                fprintf(stderr, "[%s] [WARN]: 无法访问配置文件: %s\n",
+                        timestamp(), strerror(errno));
+            }
         }
 
         if (verbose)
@@ -2247,16 +3752,70 @@ void *monitor_thread(void *arg)
                         timestamp(), i + 1, g_state.host_count, h->host, h->port);
             }
 
+            // 解析真实的 IP 和端口
+            char real_host[256];
+            int real_port;
+            int resolve_failed = 0;
+
+            if (strncmp(h->host, "txt:", 4) == 0)
+            {
+                // TXT 记录解析
+                if (resolve_txt_record(h->host, real_host, &real_port) == 0)
+                {
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析: %s -> %s:%d\n",
+                                timestamp(), h->host, real_host, real_port);
+                    }
+                }
+                else
+                {
+                    // 解析失败，标记但继续正常流程
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析失败: %s\n", timestamp(), h->host);
+                    }
+                    resolve_failed = 1;
+                }
+            }
+            else if (strncmp(h->host, "http:", 5) == 0)
+            {
+                // HTTP 重定向解析
+                if (resolve_http_redirect(h->host, h->port, real_host, &real_port) == 0)
+                {
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析: %s -> %s:%d\n",
+                                timestamp(), h->host, real_host, real_port);
+                    }
+                }
+                else
+                {
+                    // 解析失败，标记但继续正常流程
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析失败: %s\n", timestamp(), h->host);
+                    }
+                    resolve_failed = 1;
+                }
+            }
+            else
+            {
+                // 普通主机，直接使用原始地址
+                strncpy(real_host, h->host, sizeof(real_host) - 1);
+                real_host[sizeof(real_host) - 1] = '\0';
+                real_port = h->port;
+            }
+
             int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;
-            int result = test_supernode_internal(h->host, h->port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
+            int result = -1;
+            if (!resolve_failed)
+            {
+                result = test_supernode_internal(real_host, real_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
+            }
 
             pthread_mutex_lock(&g_state.lock);
             h->total_checks++;
-
-            int before_v1 = h->success_v1;
-            int before_v2 = h->success_v2;
-            int before_v2s = h->success_v2s;
-            int before_v3 = h->success_v3;
 
             if (v1_ok)
                 h->success_v1++;
@@ -2297,7 +3856,7 @@ void *monitor_thread(void *arg)
             if (verbose)
             {
                 fprintf(stderr, "[%s] [DEBUG]: %s:%d 历史记录已保存到 %s/%s_%d.dat\n",
-                        timestamp(), h->host, h->port, STATE_DIR, h->host, h->port);
+                        timestamp(), h->host, h->port, g_state_dir, h->host, h->port);
             }
 
             pthread_mutex_unlock(&g_state.lock);
@@ -2335,86 +3894,72 @@ void *monitor_thread(void *arg)
     return NULL;
 }
 
-static int init_http_server(int port)
+// 人类可读格式转换  
+static void format_size(size_t bytes, char *output, size_t output_size) {  
+    const char *units[] = {"B", "K", "M", "G", "T"};  
+    int unit_index = 0;  
+    double size = (double)bytes;  
+      
+    while (size >= 1024.0 && unit_index < 4) {  
+        size /= 1024.0;  
+        unit_index++;  
+    }  
+      
+    if (unit_index == 0) {  
+        snprintf(output, output_size, "%zu%s", bytes, units[unit_index]);  
+    } else {  
+        snprintf(output, output_size, "%.2f%s", size, units[unit_index]);  
+    }  
+}  
+  
+// 计算总存储大小  
+static size_t calculate_total_storage_size(void) {  
+    size_t total = 0;  
+      
+    for (int i = 0; i < g_state.host_count; i++) {  
+        host_stats_t *h = &g_state.hosts[i];  
+        // 每个主机的存储大小  
+        size_t host_size = sizeof(int) * 2 +  // history_index + history_count  
+                          sizeof(check_record_t) * h->max_history +  // history数组  
+                          sizeof(int) * 5;  // total_checks + success_v1/v2/v2s/v3  
+        total += host_size;  
+    }  
+      
+    return total;  
+}
+
+// 信号处理函数 - 保存所有历史记录后退出
+void signal_handler(int signum)
 {
-    int http_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (http_sock < 0)
+    if (verbose)
     {
-        fprintf(stderr, "[%s] [ERROR]: HTTP socket 创建失败: %s\n", timestamp(), strerror(errno));
-        return -1;
+        fprintf(stderr, "\n[%s] [INFO]: 收到信号 %d，正在保存历史检测记录并退出...\n",
+                timestamp(), signum);
     }
 
-    int opt = 1;
-    if (setsockopt(http_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
+    // 停止监控线程
+    g_state.running = 0;
+
+    // 保存所有主机的历史记录
+    pthread_mutex_lock(&g_state.lock);
+    for (int i = 0; i < g_state.host_count; i++)
     {
+        save_history(&g_state.hosts[i]);
         if (verbose)
         {
-            fprintf(stderr, "[%s] [WARN]: 设置端口复用失败: %s\n", timestamp(), strerror(errno));
+            fprintf(stderr, "[%s] [DEBUG]: 已保存 %s:%d 的历史检测记录\n",
+                    timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);
         }
     }
-    else if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: 端口复用设置成功\n", timestamp());
-    }
-
-    struct sockaddr_in addr = {0};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
+    pthread_mutex_unlock(&g_state.lock);
 
     if (verbose)
     {
-        fprintf(stderr, "[%s] [DEBUG]: 绑定地址 0.0.0.0:%d\n", timestamp(), port);
-    }
-    if (bind(http_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-    {
-        fprintf(stderr, "[%s] [ERROR]: HTTP bind 失败: %s\n", timestamp(), strerror(errno));
-        close(http_sock);
-        return -1;
+        fprintf(stderr, "[%s] [INFO]: 所有历史检测记录已保存，程序退出\n", timestamp());
     }
 
-    if (listen(http_sock, 5) < 0)
-    {
-        fprintf(stderr, "[%s] [ERROR]: HTTP listen 失败: %s\n", timestamp(), strerror(errno));
-        close(http_sock);
-        return -1;
-    }
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: listen() 成功 (backlog=5)\n", timestamp());
-        fprintf(stderr, "[%s] [DEBUG]: HTTP 服务器初始化完成\n", timestamp());
-    }
-    return http_sock;
+    exit(0);
 }
-
-// 信号处理函数 - 保存所有历史记录后退出  
-void signal_handler(int signum) {  
-    if (verbose) {  
-        fprintf(stderr, "\n[%s] [INFO]: 收到信号 %d，正在保存历史检测记录并退出...\n",   
-                timestamp(), signum);  
-    }  
-      
-    // 停止监控线程  
-    g_state.running = 0;  
-      
-    // 保存所有主机的历史记录  
-    pthread_mutex_lock(&g_state.lock);  
-    for (int i = 0; i < g_state.host_count; i++) {  
-        save_history(&g_state.hosts[i]);  
-        if (verbose) {  
-            fprintf(stderr, "[%s] [DEBUG]: 已保存 %s:%d 的历史检测记录\n",  
-                    timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);  
-        }  
-    }  
-    pthread_mutex_unlock(&g_state.lock);  
-      
-    if (verbose) {  
-        fprintf(stderr, "[%s] [INFO]: 所有历史检测记录已保存，程序退出\n", timestamp());  
-    }  
-      
-    exit(0);  
-}
-
 // 打印帮助信息
 static void print_help(const char *prog_name)
 {
@@ -2424,16 +3969,20 @@ static void print_help(const char *prog_name)
     printf("  -p <端口>       服务主页监听端口 (默认: 8585)\n");
     printf("  -i <分钟>       指定自动探测间隔时间（分钟）(默认: 1)\n");
     printf("  -r <分钟>       指定主页手动刷新探测间隔时间（分钟）(默认: 1)\n");
-    printf("  -f <文件>       从配置文件读取主机列表(支持备注)\n");
+    printf("  -t <秒>         指定检测超时时间未响应则判定离线（秒）(默认: 1)\n");
+    printf("  -z <次数>       指定检测超时失败后的最大重试次数 (默认: 5)\n");
+    printf("  -j <数量>       最大历史记录数量 (默认: 300)\n");  
+    printf("  -d <路径>       历史检测记录保存的目录 (默认: /tmp/n2n_monitor)\n");
+    printf("  -f <文件>       从指定的文件读取主机列表(一行一个，支持备注)\n");
     printf("  -c <社区名>     指定探测使用的社区名称 (默认: N2N_check_bot)\n");
-    printf("  -m <MAC地址>    指定探测使用的MAC地址,格式: a1:b2:c3:d4:f5:g6 (默认: a1:b2:c3:d4:f5:06)\n");
-    printf("  -4              仅使用 IPv4 (默认)\n");
-    printf("  -6              同时支持 IPv4 和 IPv6\n"); 
-    printf("  -s              启用输出到系统日志 (默认启用)\n");  
-    printf("  --no-syslog     禁用输出到系统日志\n");  
+    printf("  -m <MAC地址>    指定探测使用的MAC地址,格式: a1:b2:c3:d4:f5:06 (默认: a1:b2:c3:d4:f5:06)\n");
+    printf("  -4              服务主页仅监听 IPv4 (默认)\n");
+    printf("  -6              服务主页同时监听 IPv4 和 IPv6\n");
+    printf("  -s              启用输出到系统日志 (默认启用)\n");
+    printf("  --no-syslog     禁用输出到系统日志\n");
     printf("  -v              详细模式（显示调试信息）\n");
     printf("  -h              显示此帮助信息\n\n");
-    printf("配置文件格式:\n");
+    printf("主机列表文件格式:\n");
     printf("  host:port|备注|主页展示的主机名\n");
     printf("  例如: n2n.example.com:10086|北京电信|隐私.com\n\n");
     printf("命令示例:\n");
@@ -2446,6 +3995,7 @@ static void print_help(const char *prog_name)
 int main(int argc, char *argv[])
 {
     setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
     srand(time(NULL));
 
     int http_port = 8585;
@@ -2453,7 +4003,13 @@ int main(int argc, char *argv[])
     char *config_file = NULL;
     int arg_start = 1;
     int use_ipv6 = 0; // 默认仅 IPv4
+    int original_stderr = -1;
 
+    // 如果没有任何参数,显示帮助信息  
+    if (argc == 1) {  
+        print_help(argv[0]);  
+        return 0;  
+    }
     // 解析命令行参数
     while (arg_start < argc)
     {
@@ -2471,17 +4027,17 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "[%s] [DEBUG]: 详细模式已启用\n", timestamp());
             }
         }
-		else if (strcmp(argv[arg_start], "-s") == 0)  
-        {  
-            g_enable_syslog = 1;  
-            arg_start++;  
-            fprintf(stderr, "[%s] [INFO]: 系统日志输出已启用\n", timestamp());  
-        }  
-        else if (strcmp(argv[arg_start], "--no-syslog") == 0)  
-        {  
-            g_enable_syslog = 0;  
-            arg_start++;  
-            fprintf(stderr, "[%s] [INFO]: 系统日志输出已禁用\n", timestamp());  
+        else if (strcmp(argv[arg_start], "-s") == 0)
+        {
+            g_enable_syslog = 1;
+            arg_start++;
+            fprintf(stderr, "[%s] [INFO]: 系统日志输出已启用\n", timestamp());
+        }
+        else if (strcmp(argv[arg_start], "--no-syslog") == 0)
+        {
+            g_enable_syslog = 0;
+            arg_start++;
+            fprintf(stderr, "[%s] [INFO]: 系统日志输出已禁用\n", timestamp());
         }
         else if (strcmp(argv[arg_start], "-p") == 0 && arg_start + 1 < argc)
         {
@@ -2502,7 +4058,43 @@ int main(int argc, char *argv[])
                 return 1;
             }
             arg_start += 2;
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 检测间隔时间: %d秒\n",
+                        timestamp(), check_interval);
+            // }
         }
+        else if (strcmp(argv[arg_start], "-t") == 0 && arg_start + 1 < argc)
+        {
+            int timeout_sec = atoi(argv[arg_start + 1]);
+            if (timeout_sec <= 0 || timeout_sec > 120)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 无效的超时时间 %d 秒 (范围: 1-120秒)\n",
+                        timestamp(), timeout_sec);
+                return 1;
+            }
+            g_timeout_ms = timeout_sec * 1000; // 转换为毫秒
+            arg_start += 2;
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 检测超时时间: %d秒 (%ldms)\n",
+                        timestamp(), timeout_sec, g_timeout_ms);
+            // }
+        }
+        else if (strcmp(argv[arg_start], "-z") == 0 && arg_start + 1 < argc)  
+	{  
+    		g_max_retries = atoi(argv[arg_start + 1]);  
+    		if (g_max_retries <= 0 || g_max_retries > 20) {  
+        		fprintf(stderr, "[%s] [ERROR]: 无效的重试次数 %d (范围: 1-20)\n",   
+                		timestamp(), g_max_retries);  
+        		return 1;  
+    		}  
+    		arg_start += 2;  
+    		// if (verbose) {  
+        		fprintf(stderr, "[%s] [DEBUG]: 检测超时最大重试次数: %d 次\n",   
+                		timestamp(), g_max_retries);  
+    		// }  
+	}
         else if (strcmp(argv[arg_start], "-r") == 0 && arg_start + 1 < argc)
         {
             manual_refresh_interval = atoi(argv[arg_start + 1]);
@@ -2512,41 +4104,72 @@ int main(int argc, char *argv[])
                 return 1;
             }
             arg_start += 2;
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 主页手动刷新间隔时间: %d秒\n",
+                        timestamp(), manual_refresh_interval);
+            // }
         }
+        else if (strcmp(argv[arg_start], "-j") == 0 && arg_start + 1 < argc)  
+	{  
+    		g_max_history = atoi(argv[arg_start + 1]);  
+    		if (g_max_history <= 0 || g_max_history > 10000) {  
+        		fprintf(stderr, "[%s] [ERROR]: 无效的历史检测记录数量 %d (范围: 1-10000)\n",   
+                		timestamp(), g_max_history);  
+        		return 1;  
+    		}  
+    		arg_start += 2; 
+    		if (verbose)
+            	{
+                	fprintf(stderr, "[%s] [DEBUG]: 最大历史检测记录保存数量: %d条\n",
+                        timestamp(), g_max_history);
+            	} 
+	}  
+	else if (strcmp(argv[arg_start], "-d") == 0 && arg_start + 1 < argc)  
+	{  
+    		strncpy(g_state_dir, argv[arg_start + 1], sizeof(g_state_dir) - 1);  
+    		g_state_dir[sizeof(g_state_dir) - 1] = '\0';  
+    		arg_start += 2; 
+    		if (verbose)
+            	{
+                	fprintf(stderr, "[%s] [DEBUG]: 历史检测记录保存路径: %s\n",
+                        timestamp(), g_state_dir);
+            	}  
+	}
         else if (strcmp(argv[arg_start], "-f") == 0 && arg_start + 1 < argc)
         {
             config_file = argv[arg_start + 1];
-			strncpy(g_state.config_file_path, config_file, sizeof(g_state.config_file_path) - 1);
+            strncpy(g_state.config_file_path, config_file, sizeof(g_state.config_file_path) - 1);
             arg_start += 2;
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: 使用配置文件: %s\n", timestamp(), config_file);
-            }
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 使用的主机列表文件: %s\n", timestamp(), config_file);
+            // }
         }
         else if (strcmp(argv[arg_start], "-c") == 0 && arg_start + 1 < argc)
         {
             strncpy(g_community, argv[arg_start + 1], N2N_COMMUNITY_SIZE - 1);
             g_community[N2N_COMMUNITY_SIZE - 1] = '\0';
             arg_start += 2;
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: 使用社区名: %s\n", timestamp(), g_community);
-            }
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 探测使用的社区名: %s\n", timestamp(), g_community);
+            // }
         }
         else if (strcmp(argv[arg_start], "-m") == 0 && arg_start + 1 < argc)
         {
             if (parse_mac(argv[arg_start + 1], g_mac) < 0)
             {
                 fprintf(stderr, "[%s] [ERROR]: 无效的 MAC 地址格式: %s\n", timestamp(), argv[arg_start + 1]);
-                fprintf(stderr, "正确格式如: a1:b2:c3:d4:f5:g6\n");
+                fprintf(stderr, "正确格式如: a1:b2:c3:d4:f5:06\n");
                 return 1;
             }
             arg_start += 2;
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: 使用 MAC 地址: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            // if (verbose)
+            // {
+                fprintf(stderr, "[%s] [DEBUG]: 探测使用的 MAC 地址: %02x:%02x:%02x:%02x:%02x:%02x\n",
                         timestamp(), g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
-            }
+            // }
         }
         else if (strcmp(argv[arg_start], "-4") == 0)
         {
@@ -2572,97 +4195,101 @@ int main(int argc, char *argv[])
         }
     }
 
-	// 在初始化状态之前,设置 syslog 重定向  
-    int original_stderr = -1;  
-    if (g_enable_syslog)  
-    {  
-        // 保存原始 stderr  
-        original_stderr = dup(STDERR_FILENO);  
-          
-        // 创建管道用于 stderr 重定向  
-        if (pipe(g_syslog_pipe) == -1)  
-        {  
-            fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 管道: %s\n", timestamp(), strerror(errno));  
-            fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
-            g_enable_syslog = 0;  
-        }  
-        else  
-        {  
-            g_syslog_running = 1;  
-              
-            // 启动 syslog 转发线程  
-            if (pthread_create(&g_syslog_thread, NULL, syslog_forwarder_thread, NULL) != 0)  
-            {  
-                fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 线程: %s\n", timestamp(), strerror(errno));  
-                fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
-                close(g_syslog_pipe[0]);  
-                close(g_syslog_pipe[1]);  
-                g_enable_syslog = 0;  
-                g_syslog_running = 0;  
-            }  
-            else  
-            {  
-                // 重定向 stderr 到管道  
-                if (dup2(g_syslog_pipe[1], STDERR_FILENO) == -1)  
-                {  
-                    fprintf(stderr, "[%s] [ERROR]: 无法重定向 stderr: %s\n", timestamp(), strerror(errno));  
-                    fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());  
-                    g_syslog_running = 0;  
-                    pthread_cancel(g_syslog_thread);  
-                    close(g_syslog_pipe[0]);  
-                    close(g_syslog_pipe[1]);  
-                    g_enable_syslog = 0;  
-                }  
-                else  
-                {  
-                    close(g_syslog_pipe[1]);  // 关闭写端的原始 fd  
-                    fprintf(stderr, "[%s] [INFO]: 系统日志转发已启动\n", timestamp());  
-                }  
-            }  
-        }  
-    }  
+    // 在初始化状态之前,设置 syslog 重定向
+
+    if (g_enable_syslog)
+    {
+        // 保存原始 stderr
+        original_stderr = dup(STDERR_FILENO);
+
+        // 创建管道用于 stderr 重定向
+        if (pipe(g_syslog_pipe) == -1)
+        {
+            fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 管道: %s\n", timestamp(), strerror(errno));
+            fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());
+            g_enable_syslog = 0;
+        }
+        else
+        {
+            g_syslog_running = 1;
+
+            // 启动 syslog 转发线程
+            if (pthread_create(&g_syslog_thread, NULL, syslog_forwarder_thread, &original_stderr) != 0)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 无法创建 syslog 线程: %s\n", timestamp(), strerror(errno));
+                fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());
+                close(g_syslog_pipe[0]);
+                close(g_syslog_pipe[1]);
+                g_enable_syslog = 0;
+                g_syslog_running = 0;
+            }
+            else
+            {
+                // 重定向 stderr 到管道
+                if (dup2(g_syslog_pipe[1], STDERR_FILENO) == -1)
+                {
+                    fprintf(stderr, "[%s] [ERROR]: 无法重定向 stderr: %s\n", timestamp(), strerror(errno));
+                    fprintf(stderr, "[%s] [WARN]: 系统日志功能将被禁用\n", timestamp());
+                    g_syslog_running = 0;
+                    pthread_cancel(g_syslog_thread);
+                    close(g_syslog_pipe[0]);
+                    close(g_syslog_pipe[1]);
+                    g_enable_syslog = 0;
+                }
+                else
+                {
+                    close(g_syslog_pipe[1]); // 关闭写端的原始 fd
+                    fprintf(stderr, "[%s] [INFO]: 系统日志转发已启动\n", timestamp());
+                }
+            }
+        }
+    }
 
     // 初始化状态
     pthread_mutex_init(&g_state.lock, NULL);
     g_state.check_interval_minutes = check_interval;
     g_state.start_time = time(NULL);
     g_state.running = 1;
-	// 注册信号处理函数  
-	signal(SIGTERM, signal_handler);  // kill 命令  
-	signal(SIGINT, signal_handler);   // Ctrl+C  
-	signal(SIGHUP, signal_handler);   // 终端断开 
-	if (verbose) {  
-    	fprintf(stderr, "[%s] [DEBUG]: 已注册信号处理函数 (SIGTERM, SIGINT, SIGHUP)\n",   
-            timestamp());  
-	}
+    // 注册信号处理函数
+    signal(SIGTERM, signal_handler); // kill 命令
+    signal(SIGINT, signal_handler);  // Ctrl+C
+    signal(SIGHUP, signal_handler);  // 终端断开
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 已注册信号处理函数 (SIGTERM, SIGINT, SIGHUP)\n",
+                timestamp());
+    }
 
     // 创建状态目录
     struct stat st = {0};
-    if (stat(STATE_DIR, &st) == -1)
+    if (stat(g_state_dir, &st) == -1)
     {
-        if (mkdir(STATE_DIR, 0755) == -1)
+        if (mkdir(g_state_dir, 0755) == -1)
         {
-            fprintf(stderr, "[%s] [ERROR]: 无法创建状态目录 %s: %s\n",
-                    timestamp(), STATE_DIR, strerror(errno));
-            fprintf(stderr, "[%s] [WARN]: 历史记录功能将不可用\n", timestamp());
+            fprintf(stderr, "[%s] [ERROR]: 无法创建历史检测记录保存的目录 %s: %s\n",
+                    timestamp(), g_state_dir, strerror(errno));
+            fprintf(stderr, "[%s] [WARN]: 历史检测记录功能将不可用\n", timestamp());
         }
         else
         {
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 已创建状态目录: %s\n", timestamp(), STATE_DIR);
+                fprintf(stderr, "[%s] [DEBUG]: 已创建历史检测记录保存目录: %s\n", timestamp(), g_state_dir);
             }
         }
     }
+    
     // 读取配置文件
     if (config_file)
     {
         load_config(config_file);
-		// 记录初始修改时间  
-    	struct stat st;  
-    	if (stat(config_file, &st) == 0) {  
-        	g_state.config_mtime = st.st_mtime;  
-    	}	
+        // 记录初始修改时间
+        struct stat st;
+        if (stat(config_file, &st) == 0)
+        {
+            g_state.config_mtime = st.st_mtime;
+        }
     }
 
     if (verbose)
@@ -2683,68 +4310,136 @@ int main(int argc, char *argv[])
         char host[256] = {0};
         int port = 10086;
         char note[512] = {0};
-        char display_name[256] = {0};  // 新增: 前端显示主机名
+        char display_name[256] = {0}; // 新增: 前端显示主机名
 
-        // 解析格式: host:port|备注|前端显示主机名 或 host:port|备注 或 host:port  
-    	char *first_pipe = strchr(host_str, '|');  
-    	if (first_pipe)  
-    	{  
-        	*first_pipe = '\0';  
-        	char *second_pipe = strchr(first_pipe + 1, '|');  
-        	if (second_pipe)  
-        	{  
-            		// 三段式格式: host:port|备注|前端显示主机名  
-            		*second_pipe = '\0';  
-            		strncpy(note, first_pipe + 1, sizeof(note) - 1);  
-            		strncpy(display_name, second_pipe + 1, sizeof(display_name) - 1);  
-        	}  
-        	else  
-        	{  
-            		// 兼容旧格式: host:port|备注  
-            		strncpy(note, first_pipe + 1, sizeof(note) - 1);  
-        	}  
-    	}
-        // 解析端口
-        char *port_str = strchr(host_str, ':');
+        // 解析格式: host:port|备注|前端显示主机名 或 host:port|备注 或 host:port
+        char *first_pipe = strchr(host_str, '|');
+        if (first_pipe)
+        {
+            *first_pipe = '\0';
+            char *second_pipe = strchr(first_pipe + 1, '|');
+            if (second_pipe)
+            {
+                // 三段式格式: host:port|备注|前端显示主机名
+                *second_pipe = '\0';
+                strncpy(note, first_pipe + 1, sizeof(note) - 1);
+                strncpy(display_name, second_pipe + 1, sizeof(display_name) - 1);
+            }
+            else
+            {
+                // 兼容旧格式: host:port|备注
+                strncpy(note, first_pipe + 1, sizeof(note) - 1);
+            }
+        }
+        // 解析端口 - 支持特殊前缀
+        char *port_str = NULL;
+        int has_special_prefix = 0;
+
+        // 检查特殊前缀
+        if (strncmp(host_str, "txt:", 4) == 0)
+        {
+            has_special_prefix = 1;
+            // 跳过 txt: 前缀后再查找端口
+            port_str = strchr(host_str + 4, ':');
+        }
+        else if (strncmp(host_str, "http:", 5) == 0)
+        {
+            has_special_prefix = 1;
+            // 检查是否有路径
+            const char *host_part = host_str + 5;
+            char *slash = strchr(host_part, '/');
+
+            if (slash)
+            {
+                // 有路径,不提取端口,保持完整主机名
+                port_str = NULL;
+                port = 0; // 直接设为 0
+            }
+            else
+            {
+                // 没有路径,正常查找端口
+                port_str = strchr(host_part, ':');
+            }
+        }
+        else
+        {
+            // 普通主机
+            port_str = strchr(host_str, ':');
+        }
+
         if (port_str)
         {
             *port_str = '\0';
             port = atoi(port_str + 1);
-            if (port <= 0 || port > 65535)
+
+            // 特殊前缀允许端口为 0
+            if (has_special_prefix)
             {
-                fprintf(stderr, "[%s] [ERROR]: 无效的端口号 %d (主机: %s)\n", timestamp(), port, host_str);
-                free(host_str);
-                continue;
+                if (port < 0 || port > 65535)
+                {
+                    fprintf(stderr, "[%s] [ERROR]: 无效的端口号 %d (主机: %s)\n", timestamp(), port, host_str);
+                    free(host_str);
+                    continue;
+                }
+            }
+            else
+            {
+                // 普通主机端口必须有效
+                if (port <= 0 || port > 65535)
+                {
+                    fprintf(stderr, "[%s] [ERROR]: 无效的端口号 %d (主机: %s)\n", timestamp(), port, host_str);
+                    free(host_str);
+                    continue;
+                }
+            }
+        }
+        else
+        {
+            // 没有端口号
+            if (has_special_prefix)
+            {
+                // 特殊前缀允许无端口,自动填充为 0
+                port = 0;
+            }
+        }
+        strncpy(host, host_str, sizeof(host) - 1);
+
+        // 【新增】检查是否重复
+        int is_duplicate = 0;
+        for (int j = 0; j < g_state.host_count; j++)
+        {
+            if (strcmp(g_state.hosts[j].host, host) == 0 &&
+                g_state.hosts[j].port == port)
+            {
+                is_duplicate = 1;
+                fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (命令行参数 %d): %s:%d\n",
+                        timestamp(), i + 1, host, port);
+                break;
             }
         }
 
-        strncpy(host, host_str, sizeof(host) - 1);
-
-		// 【新增】检查是否重复  
-    	int is_duplicate = 0;  
-    	for (int j = 0; j < g_state.host_count; j++)  
-    	{  
-        	if (strcmp(g_state.hosts[j].host, host) == 0 &&   
-            	g_state.hosts[j].port == port)  
-        	{  
-            	is_duplicate = 1;  
-            	fprintf(stderr, "[%s] [WARN]: 忽略重复的主机 (命令行参数 %d): %s:%d\n",   
-                    timestamp(), i + 1, host, port);  
-            	break;  
-        	}  
-    	}  
-  
-    	if (is_duplicate)  
-    	{  
-        	free(host_str);  
-        	continue;  // 跳过这个重复的主机  
-    	}
+        if (is_duplicate)
+        {
+            free(host_str);
+            continue; // 跳过这个重复的主机
+        }
 
         host_stats_t *h = &g_state.hosts[g_state.host_count];
         strncpy(h->host, host_str, sizeof(h->host) - 1);
         h->port = port;
         strncpy(h->note, note, sizeof(h->note) - 1);
         strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);
+        
+        // 初始化 max_history 并分配内存  
+	h->max_history = g_max_history;  
+	h->history = calloc(g_max_history, sizeof(check_record_t));  
+	if (!h->history) {  
+    		fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",  
+            		timestamp(), host_str, port);  
+    		free(host_str);  
+    		continue;  
+	}
+
         load_history(h);
         g_state.host_count++;
 
@@ -2767,11 +4462,20 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    printf("[%s] [INFO]: 共计检测 %d 个主机\n", timestamp(), g_state.host_count);
+    //printf("[%s] [INFO]: 共计检测 %d 个主机\n", timestamp(), g_state.host_count);
+    // 计算并输出存储信息  
+    size_t total_size = calculate_total_storage_size();  
+    char size_str[64];  
+    format_size(total_size, size_str, sizeof(size_str));  
+  
+    fprintf(stderr, "[%s] [INFO]: 历史检测记录配置:\n", timestamp());  
+    fprintf(stderr, "[%s] [INFO]:   - 保存路径: %s\n", timestamp(), g_state_dir);  
+    fprintf(stderr, "[%s] [INFO]:   - 最大记录数: %d 条/主机\n", timestamp(), g_max_history);  
+    fprintf(stderr, "[%s] [INFO]:   - 主机数量: %d 个\n", timestamp(), g_state.host_count);  
+    fprintf(stderr, "[%s] [INFO]:   - 预计占用: %s\n", timestamp(), size_str);
 
     // 初始化 HTTP 服务器 (支持 IPv4/IPv6)
     int http_sock = -1;
-
     if (use_ipv6)
     {
         // 尝试创建 IPv6 socket (同时支持 IPv4)
@@ -2884,19 +4588,19 @@ int main(int argc, char *argv[])
         {
             // if (verbose)
             // {
-                char client_ip[INET6_ADDRSTRLEN];
-                if (client_addr.ss_family == AF_INET)
-                {
-                    inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
-                              client_ip, sizeof(client_ip));
-                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
-                }
-                else if (client_addr.ss_family == AF_INET6)
-                {
-                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
-                              client_ip, sizeof(client_ip));
-                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
-                }
+            char client_ip[INET6_ADDRSTRLEN];
+            if (client_addr.ss_family == AF_INET)
+            {
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
+                          client_ip, sizeof(client_ip));
+                fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
+            }
+            else if (client_addr.ss_family == AF_INET6)
+            {
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
+                          client_ip, sizeof(client_ip));
+                fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
+            }
             // }
             handle_http_request(client_sock);
         }
