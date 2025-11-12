@@ -4557,6 +4557,18 @@ int main(int argc, char *argv[])
         }
         else if (strcmp(argv[arg_start], "-c") == 0 && arg_start + 1 < argc)
         {
+            const char *community_input = argv[arg_start + 1];  
+            size_t community_len = strlen(community_input);  
+      
+            // 检查社区名长度是否超过 14 字符  
+            if (community_len > 14)  
+            {  
+                fprintf(stderr, "[%s] [ERROR]: 您输入的社区名社区名 %s 长度超出限制: %zu 字符 (最大: 14 字符)\n",  
+                    timestamp(), community_input, community_len);  
+                fprintf(stderr, "[%s] [INFO]: 请使用不超过 14 个字符的社区名！\n",  
+                    timestamp());  
+                return 1;  // 退出程序  
+            }
             strncpy(g_community, argv[arg_start + 1], N2N_COMMUNITY_SIZE - 1);
             g_community[N2N_COMMUNITY_SIZE - 1] = '\0';
             arg_start += 2;
