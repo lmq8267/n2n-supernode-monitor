@@ -29,16 +29,16 @@
 #define MSG_TYPE_REGISTER_ACK 4
 #define MAX_HOSTS 100
 
-static int g_enable_syslog = 1;   // 输出日志到系统日志，默认启用
-static int g_syslog_pipe[2];      // 管道文件描述符
-static pthread_t g_syslog_thread; // syslog 转发线程
-static int g_syslog_running = 0;  // 线程运行标志
-time_t last_manual_refresh = 0;   // 记录上次手动刷新时间
-int manual_refresh_interval = 1;  // 默认1分钟检测间隔
-static long g_timeout_ms = 1000;  // 默认 1000ms (1秒)未响应判定为离线
-static int g_max_retries = 5;  // 默认5次 检测重试次数
-static int g_max_history = 300;  // 默认300条 保存的最大历史检测记录  
-static char g_state_dir[1024] = "/tmp/n2n_monitor";  // 默认历史检测记录保存路径 
+static int g_enable_syslog = 1;                     // 输出日志到系统日志，默认启用
+static int g_syslog_pipe[2];                        // 管道文件描述符
+static pthread_t g_syslog_thread;                   // syslog 转发线程
+static int g_syslog_running = 0;                    // 线程运行标志
+time_t last_manual_refresh = 0;                     // 记录上次手动刷新时间
+int manual_refresh_interval = 1;                    // 默认1分钟检测间隔
+static long g_timeout_ms = 1000;                    // 默认 1000ms (1秒)未响应判定为离线
+static int g_max_retries = 5;                       // 默认5次 检测重试次数
+static int g_max_history = 300;                     // 默认300条 保存的最大历史检测记录
+static char g_state_dir[1024] = "/tmp/n2n_monitor"; // 默认历史检测记录保存路径
 static int verbose = 0;
 static char g_community[N2N_COMMUNITY_SIZE] = "N2N_check_bot";
 static uint8_t g_mac[N2N_MAC_SIZE] = {0xa1, 0xb2, 0xc3, 0xd4, 0xf5, 0x06}; // a1:b2:c3:d4:f5:06
@@ -66,9 +66,9 @@ typedef struct
     time_t last_check;
     char last_status[64];
     check_record_t *history; // 循环历史记录
-    int history_index;                   // 当前写入位置
-    int history_count;                   // 已有记录数
-    int max_history;  // 记录该主机的最大历史数
+    int history_index;       // 当前写入位置
+    int history_count;       // 已有记录数
+    int max_history;         // 记录该主机的最大历史数
 } host_stats_t;
 
 typedef struct
@@ -441,7 +441,7 @@ static int is_valid_v3_ack(const uint8_t *buf, size_t len, const uint8_t *expect
 // 检测单个 supernode (使用单socket非阻塞方式)
 int test_supernode_internal(const char *host, int port, int *v1_ok, int *v2_ok, int *v2s_ok, int *v3_ok)
 {
-    const int MAX_RETRIES = g_max_retries - 1;  // 本次也算一次，所以减1
+    const int MAX_RETRIES = g_max_retries - 1; // 本次也算一次，所以减1
     int retry_attempt = 0;
 
     *v1_ok = *v2_ok = *v2s_ok = *v3_ok = 0;
@@ -1080,14 +1080,15 @@ static void load_config(const char *config_file)
                     note[0] ? note : "(无)",
                     display_name[0] ? display_name : "(无)");
         }
-        // 初始化 max_history 并分配内存  
-	h->max_history = g_max_history;  
-	h->history = calloc(g_max_history, sizeof(check_record_t));  
-	if (!h->history) {  
-    		fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",  
-            		timestamp(), host, port);  
-    		continue;  // 跳过这个主机  
-	}
+        // 初始化 max_history 并分配内存
+        h->max_history = g_max_history;
+        h->history = calloc(g_max_history, sizeof(check_record_t));
+        if (!h->history)
+        {
+            fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",
+                    timestamp(), host, port);
+            continue; // 跳过这个主机
+        }
 
         load_history(h);
         g_state.host_count++;
@@ -2048,25 +2049,38 @@ void generate_html(char *buf, size_t bufsize)
     // 智能格式化运行时间（中文注释）
     char uptime_str[256] = "";
     int has_content = 0;
+    char interval_str[256] = "";
+    int interval_seconds = g_state.check_interval_minutes * 60;
+    int has_interval_content = 0;
 
     // 计算各个时间单位
     int years = uptime / (365 * 24 * 3600);
     uptime %= (365 * 24 * 3600);
+    int interval_years = interval_seconds / (365 * 24 * 3600);
+    interval_seconds %= (365 * 24 * 3600);
 
     int months = uptime / (30 * 24 * 3600);
     uptime %= (30 * 24 * 3600);
+    int interval_months = interval_seconds / (30 * 24 * 3600);
+    interval_seconds %= (30 * 24 * 3600);
 
     int weeks = uptime / (7 * 24 * 3600);
     uptime %= (7 * 24 * 3600);
 
     int days = uptime / (24 * 3600);
     uptime %= (24 * 3600);
+    int interval_days = interval_seconds / (24 * 3600);
+    interval_seconds %= (24 * 3600);
 
     int hours = uptime / 3600;
     uptime %= 3600;
+    int interval_hours = interval_seconds / 3600;
+    interval_seconds %= 3600;
 
     int minutes = uptime / 60;
     int seconds = uptime % 60;
+    int interval_minutes = interval_seconds / 60;
+    int interval_secs = interval_seconds % 60;
 
     // 只显示有值的单位
     if (years > 0)
@@ -2075,11 +2089,23 @@ void generate_html(char *buf, size_t bufsize)
                  "%d年", years);
         has_content = 1;
     }
+    if (interval_years > 0)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%d年", interval_years);
+        has_interval_content = 1;
+    }
     if (months > 0)
     {
         snprintf(uptime_str + strlen(uptime_str), sizeof(uptime_str) - strlen(uptime_str),
                  "%s%d月", has_content ? " " : "", months);
         has_content = 1;
+    }
+    if (interval_months > 0)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%s%d个月", has_interval_content ? " " : "", interval_months);
+        has_interval_content = 1;
     }
     if (weeks > 0)
     {
@@ -2093,11 +2119,23 @@ void generate_html(char *buf, size_t bufsize)
                  "%s%d天", has_content ? " " : "", days);
         has_content = 1;
     }
+    if (interval_days > 0)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%s%d天", has_interval_content ? " " : "", interval_days);
+        has_interval_content = 1;
+    }
     if (hours > 0)
     {
         snprintf(uptime_str + strlen(uptime_str), sizeof(uptime_str) - strlen(uptime_str),
                  "%s%d时", has_content ? " " : "", hours);
         has_content = 1;
+    }
+    if (interval_hours > 0)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%s%d小时", has_interval_content ? " " : "", interval_hours);
+        has_interval_content = 1;
     }
     if (minutes > 0)
     {
@@ -2105,10 +2143,21 @@ void generate_html(char *buf, size_t bufsize)
                  "%s%d分", has_content ? " " : "", minutes);
         has_content = 1;
     }
+    if (interval_minutes > 0)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%s%d分钟", has_interval_content ? " " : "", interval_minutes);
+        has_interval_content = 1;
+    }
     if (seconds > 0 || !has_content)
     { // 如果所有单位都是0,至少显示秒
         snprintf(uptime_str + strlen(uptime_str), sizeof(uptime_str) - strlen(uptime_str),
                  "%s%d秒", has_content ? " " : "", seconds);
+    }
+    if (interval_secs > 0 || !has_interval_content)
+    {
+        snprintf(interval_str + strlen(interval_str), sizeof(interval_str) - strlen(interval_str),
+                 "%s%d秒", has_interval_content ? " " : "", interval_secs);
     }
 
     // 找到最近的检测时间
@@ -2136,9 +2185,6 @@ void generate_html(char *buf, size_t bufsize)
     int refresh_seconds = g_state.check_interval_minutes * 60;
 
     int len = snprintf(buf, bufsize,
-                       "HTTP/1.1 200 OK\r\n"
-                       "Content-Type: text/html; charset=utf-8\r\n"
-                       "Connection: close\r\n\r\n"
                        "<!DOCTYPE html>\n"
                        "<html lang='zh-CN'><head>\n"
                        "<meta charset='utf-8'>\n"
@@ -2190,8 +2236,9 @@ void generate_html(char *buf, size_t bufsize)
                        "thead th.sortable::after{content:' ⇅';opacity:0.4;font-size:11px;}\n"
                        "thead th.sort-asc::after{content:' ↑';opacity:1;color:var(--accent);}\n"
                        "thead th.sort-desc::after{content:' ↓';opacity:1;color:var(--accent);}\n"
-                       "tbody td{padding:12px;border-bottom:1px solid #f3f4f6;vertical-align:middle;text-align:center;}\n"
-                       "tr:hover td{background:#f9fafb;}\n"
+                       "tbody td{padding:12px;border-bottom:1px solid #f3f4f6;vertical-align:middle;text-align:center;transition:all 0.2s ease;}\n"
+                       "tr:hover td{background:#f9fafb;transform:scale(1.01);}\n"
+                       "tr{transition:all 0.2s ease;}\n"
                        ".host-cell{color:var(--accent-2);cursor:pointer;text-decoration:underline;font-weight:500;}\n"
                        ".version-badge{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600;margin:2px;}\n"
                        ".badge-v1{background:#f3e8ff;color:#7c3aed;border:1px solid #e9d5ff;}\n"
@@ -2338,16 +2385,18 @@ void generate_html(char *buf, size_t bufsize)
                        "  header.className = 'sortable ' + (sortOrder === 1 ? 'sort-asc' : 'sort-desc');\n"
                        "}\n"
                        "var tooltip = null;\n"
+                       "var tooltip = null;\n"
                        "function showHistoryTooltip(event, historyData) {\n"
                        "  if (!tooltip) {\n"
                        "    tooltip = document.createElement('div');\n"
                        "    tooltip.className = 'tooltip';\n"
                        "    document.body.appendChild(tooltip);\n"
                        "  }\n"
-                       "  var html = '<div class=\"tooltip-title\">最近检测记录</div>';\n"
+                       "  \n"
+                       "  var html = '<div class=\"tooltip-title\">最近60次检测记录</div>';\n"
                        "  html += '<div class=\"tooltip-history\">';\n"
                        "  var records = historyData.split(',');\n"
-                       "  var maxDisplay = 60; // 显示最近60个(两行,每行30个)\n"
+                       "  var maxDisplay = 60;\n"
                        "  var startIdx = Math.max(0, records.length - maxDisplay);\n"
                        "  for (var i = startIdx; i < records.length; i++) {\n"
                        "    var parts = records[i].split(':');\n"
@@ -2358,13 +2407,40 @@ void generate_html(char *buf, size_t bufsize)
                        "  }\n"
                        "  html += '</div>';\n"
                        "  tooltip.innerHTML = html;\n"
-                       "  tooltip.classList.add('show');\n"
-                       "  var left = event.pageX + 12;\n"
-                       "  var top = event.pageY + 12;\n"
-                       "  if (left + 340 > window.innerWidth) left = window.innerWidth - 340 - 12;\n"
-                       "  if (top + 100 > window.innerHeight) top = window.innerHeight - 100 - 12;\n" // 调整高度检测
+                       "  \n"
+                       "  // 获取触发元素的位置\n"
+                       "  var target = event.currentTarget || event.target;\n"
+                       "  var rect = target.getBoundingClientRect();\n"
+                       "  \n"
+                       "  // 临时显示以获取实际尺寸\n"
+                       "  tooltip.style.visibility = 'hidden';\n"
+                       "  tooltip.style.display = 'block';\n"
+                       "  tooltip.style.opacity = '0';\n"
+                       "  var tooltipRect = tooltip.getBoundingClientRect();\n"
+                       "  \n"
+                       "  // 计算位置 (优先显示在下方)\n"
+                       "  var left = rect.left + (rect.width - tooltipRect.width) / 2;\n"
+                       "  var top = rect.bottom + 8;\n"
+                       "  \n"
+                       "  // 检查下方空间是否足够\n"
+                       "  if (top + tooltipRect.height > window.innerHeight) {\n"
+                       "    // 下方空间不足,显示在上方\n"
+                       "    top = rect.top - tooltipRect.height - 8;\n"
+                       "  }\n"
+                       "  \n"
+                       "  // 水平边界检查\n"
+                       "  if (left < 12) left = 12;\n"
+                       "  if (left + tooltipRect.width > window.innerWidth - 12) {\n"
+                       "    left = window.innerWidth - tooltipRect.width - 12;\n"
+                       "  }\n"
+                       "  \n"
+                       "  // 应用位置 (使用 fixed 定位)\n"
+                       "  tooltip.style.position = 'fixed';\n"
                        "  tooltip.style.left = left + 'px';\n"
                        "  tooltip.style.top = top + 'px';\n"
+                       "  tooltip.style.visibility = '';\n"
+                       "  tooltip.style.opacity = '';\n"
+                       "  tooltip.classList.add('show');\n"
                        "}\n"
                        // 新增模态窗口函数（中文注释）
                        "function showHistoryModal(host, port, historyData) {\n"
@@ -2451,29 +2527,29 @@ void generate_html(char *buf, size_t bufsize)
                        "function updateTopNotice(){\n"
                        "  var rows = document.getElementById('hostTable').getElementsByTagName('tr');\n"
                        "  var total = 0; var offline = 0;\n"
-                       "  var firstOfflineHost = null;\n" // 记录第一个离线主机
-                       "  var firstOfflinePort = null;\n"
+                       "  var offlineHosts = [];\n" // 改为数组
                        "  for (var i=1;i<rows.length;i++){\n"
                        "    if (rows[i].style.display === 'none') continue;\n"
                        "    total++;\n"
                        "    var s = rows[i].cells[4].textContent || '';\n"
                        "    if (s.indexOf('离线') !== -1) {\n"
                        "      offline++;\n"
-                       "      if (!firstOfflineHost) {\n" // 记录第一个离线主机
-                       "        firstOfflineHost = rows[i].getAttribute('data-host');\n"
-                       "        firstOfflinePort = rows[i].getAttribute('data-port');\n"
-                       "      }\n"
+                       "      offlineHosts.push({\n"
+                       "        host: rows[i].getAttribute('data-host'),\n"
+                       "        port: rows[i].getAttribute('data-port')\n"
+                       "      });\n"
                        "    }\n"
                        "  }\n"
                        "  var noticeEl = document.getElementById('topNotice');\n"
                        "  if (!noticeEl) return;\n"
                        "  if (offline > 0) {\n"
                        "    noticeEl.className = 'top-notice card notice-warn';\n"
-                       "    noticeEl.innerHTML = '<div class=\"notice-left\"><div class=\"notice-dot\" style=\"background:linear-gradient(90deg,#fb7185,#ef4444)\"></div><div><div style=\"font-weight:800\">存在异常服务</div><div class=\"sub\">发现 '+offline+' 个服务异常，请尽快检查</div></div></div><div><button class=\"notice-btn\" onclick=\"scrollToHost(\\''+firstOfflineHost+'\\', '+firstOfflinePort+')\">查看详情</button></div>';\n"
+                       "    noticeEl.innerHTML = '<div class=\"notice-left\"><div class=\"notice-dot\" style=\"background:linear-gradient(90deg,#fb7185,#ef4444)\"></div><div><div style=\"font-weight:800\">存在异常服务</div><div class=\"sub\">发现 '+offline+' 个服务异常，请尽快检查</div></div></div><div><button class=\"notice-btn\" onclick=\"scrollToAllOfflineHosts()\">查看详情</button></div>';\n"
                        "  } else {\n"
                        "    noticeEl.className = 'top-notice card notice-ok';\n"
                        "    noticeEl.innerHTML = '<div class=\"notice-left\"><div class=\"notice-dot\" style=\"background:linear-gradient(90deg,#34d399,#10b981)\"></div><div><div style=\"font-weight:800\">所有服务状态正常</div><div class=\"sub\">当前 '+total+' 个服务全部在线</div></div></div><div></div>';\n"
                        "  }\n"
+                       "  window.offlineHostsList = offlineHosts;\n"
                        "}\n"
                        "function scrollToTable(){ var el = document.querySelector('.table-wrap'); if(el) el.scrollIntoView({behavior:'smooth',block:'start'}); }\n"
                        "\n"
@@ -2492,6 +2568,35 @@ void generate_html(char *buf, size_t bufsize)
                        "      row.classList.remove('blink-highlight');\n"
                        "    }, 3000);  // 5次闪烁 × 0.6秒 = 3秒\n"
                        "  }, 500);  // 等待滚动完成\n"
+                       "}\n"
+                       "function scrollToAllOfflineHosts() {\n"
+                       "  if (!window.offlineHostsList || window.offlineHostsList.length === 0) return;\n"
+                       "  var firstHost = window.offlineHostsList[0];\n"
+                       "  var firstRowId = 'host-' + firstHost.host.replace(/\\./g, '-').replace(/:/g, '-').replace(/\\//g, '-') + '-' + firstHost.port;\n"
+                       "  var firstRow = document.getElementById(firstRowId);\n"
+                       "  if (firstRow) {\n"
+                       "    firstRow.scrollIntoView({ behavior: 'smooth', block: 'center' });\n"
+                       "  }\n"
+                       "  setTimeout(function() {\n"
+                       "    for (var i = 0; i < window.offlineHostsList.length; i++) {\n"
+                       "      var host = window.offlineHostsList[i];\n"
+                       "      var rowId = 'host-' + host.host.replace(/\\./g, '-').replace(/:/g, '-').replace(/\\//g, '-') + '-' + host.port;\n"
+                       "      var row = document.getElementById(rowId);\n"
+                       "      if (row) {\n"
+                       "        row.classList.add('blink-highlight');\n"
+                       "      }\n"
+                       "    }\n"
+                       "    setTimeout(function() {\n"
+                       "      for (var i = 0; i < window.offlineHostsList.length; i++) {\n"
+                       "        var host = window.offlineHostsList[i];\n"
+                       "        var rowId = 'host-' + host.host.replace(/\\./g, '-').replace(/:/g, '-').replace(/\\//g, '-') + '-' + host.port;\n"
+                       "        var row = document.getElementById(rowId);\n"
+                       "        if (row) {\n"
+                       "          row.classList.remove('blink-highlight');\n"
+                       "        }\n"
+                       "      }\n"
+                       "    }, 3000);\n"
+                       "  }, 500);\n"
                        "}\n"
                        "function manualRefresh() { \n"
                        "var btn = document.getElementById('refreshBtn');\n"
@@ -2558,7 +2663,7 @@ void generate_html(char *buf, size_t bufsize)
                        "</div>\n"
                        "<div class='stat'>\n"
                        "<h3>检测间隔</h3>\n"
-                       "<p>%d 分钟</p>\n"
+                       "<p>%s</p>\n"
                        "</div>\n"
                        "<div class='stat'>\n"
                        "<h3>最后检测</h3>\n"
@@ -2595,14 +2700,22 @@ void generate_html(char *buf, size_t bufsize)
                        "<tbody>\n",
                        refresh_seconds,
                        uptime_str,
-                       g_state.check_interval_minutes,
+                       interval_str,
                        time_str);
 
-    // 注意：下面保留原有遍历逻辑与字段，但为了让前端的进度条动画更平滑，增加 data-target 属性并保持原有 class 名称与文本内容不变（中文注释）
     for (int i = 0; i < g_state.host_count; i++)
     {
-        if ((size_t)len >= bufsize - 2000)
+        // 动态检查剩余空间 (保留 5% 作为安全余量)
+        size_t safety_margin = bufsize / 20;
+        if ((size_t)len >= bufsize - safety_margin)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [WARN]: 缓冲区接近上限，已生成 %d/%d 个主机\n",
+                        timestamp(), i, g_state.host_count);
+            }
             break;
+        }
 
         host_stats_t *h = &g_state.hosts[i];
         // 创建安全的主机 ID(将点号替换为连字符)
@@ -2790,32 +2903,105 @@ void generate_html(char *buf, size_t bufsize)
     pthread_mutex_unlock(&g_state.lock);
 }
 
-// 不区分大小写查找请求头  
-static char* find_header_value(const char *request, const char *header_name) {  
-    const char *p = request;  
-    size_t header_len = strlen(header_name);  
-      
-    while (*p) {  
-        // 检查是否匹配请求头名称(不区分大小写)  
-        int match = 1;  
-        for (size_t i = 0; i < header_len; i++) {  
-            char c1 = tolower(p[i]);  
-            char c2 = tolower(header_name[i]);  
-            if (c1 != c2) {  
-                match = 0;  
-                break;  
-            }  
-        }  
-          
-        if (match && p[header_len] == ':') {  
-            // 找到匹配的请求头,跳过冒号和空格  
-            const char *value = p + header_len + 1;  
-            while (*value == ' ') value++;  
-            return (char*)value;  
-        }  
-        p++;  
-    }  
-    return NULL;  
+// 不区分大小写查找请求头
+static char *find_header_value(const char *request, const char *header_name)
+{
+    const char *p = request;
+    size_t header_len = strlen(header_name);
+
+    while (*p)
+    {
+        // 检查是否匹配请求头名称(不区分大小写)
+        int match = 1;
+        for (size_t i = 0; i < header_len; i++)
+        {
+            char c1 = tolower(p[i]);
+            char c2 = tolower(header_name[i]);
+            if (c1 != c2)
+            {
+                match = 0;
+                break;
+            }
+        }
+
+        if (match && p[header_len] == ':')
+        {
+            // 找到匹配的请求头,跳过冒号和空格
+            const char *value = p + header_len + 1;
+            while (*value == ' ')
+                value++;
+            return (char *)value;
+        }
+        p++;
+    }
+    return NULL;
+}
+
+// HTTP 分块传输函数
+void send_chunked_response(int client_sock, const char *content, size_t content_len)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 使用分块传输发送 %zu 字节数据\n",
+                timestamp(), content_len);
+    }
+
+    // 发送 HTTP 头 (使用 chunked 编码)
+    const char *header =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n";
+
+    send(client_sock, header, strlen(header), 0);
+
+    // 分块大小 (16KB 每块)
+    const size_t chunk_size = 16384;
+    size_t offset = 0;
+
+    while (offset < content_len)
+    {
+        size_t remaining = content_len - offset;
+        size_t current_chunk = (remaining > chunk_size) ? chunk_size : remaining;
+
+        // 发送块大小 (十六进制格式)
+        char chunk_header[32];
+        int header_len = snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n", current_chunk);
+        send(client_sock, chunk_header, header_len, 0);
+
+        // 发送块数据
+        ssize_t sent = send(client_sock, content + offset, current_chunk, 0);
+        if (sent <= 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 分块传输失败: %s\n",
+                        timestamp(), strerror(errno));
+            }
+            break;
+        }
+
+        // 发送块结束标记
+        send(client_sock, "\r\n", 2, 0);
+
+        offset += current_chunk;
+
+        if (verbose && offset % (chunk_size * 10) == 0)
+        {
+            fprintf(stderr, "[%s] [DEBUG]: 已发送 %zu/%zu 字节 (%.1f%%)\n",
+                    timestamp(), offset, content_len,
+                    (offset * 100.0) / content_len);
+        }
+    }
+
+    // 发送结束块 (大小为 0)
+    send(client_sock, "0\r\n\r\n", 5, 0);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 分块传输完成，共发送 %zu 字节\n",
+                timestamp(), offset);
+    }
 }
 
 void generate_svg_response(int client_sock, int is_online, float uptime,
@@ -3067,7 +3253,15 @@ void generate_svg_response(int client_sock, int is_online, float uptime,
         fprintf(stderr, "[%s] [DEBUG]: SVG 生成完成，总长度: %d 字节\n", timestamp(), len);
     }
 
-    send(client_sock, svg, len, 0);
+    // 对于小响应，直接发送；大响应使用分块传输
+    if (len < 4096)
+    {
+        send(client_sock, svg, len, 0);
+    }
+    else
+    {
+        send_chunked_response(client_sock, svg, len);
+    }
     close(client_sock);
 }
 
@@ -3438,7 +3632,7 @@ void handle_refresh_request(int client_sock)
     {
         fprintf(stderr, "[%s] [DEBUG]: 开始执行刷新,检测 %d 个主机\n", timestamp(), g_state.host_count);
     }
-	// 检查配置文件是否被修改
+    // 检查配置文件是否被修改
     if (g_state.config_file_path[0] != '\0')
     {
         struct stat st;
@@ -3589,51 +3783,55 @@ void handle_http_request(int client_sock)
     if (n > 0)
     {
         request[n] = '\0';
-        
-        //fprintf(stderr, "[%s] [DEBUG]: 请求头： %s \n", timestamp(), request);
-        
-        // 查找代理请求头  
-        char *xff = find_header_value(request, "X-Forwarded-For");  
-        char *xri = find_header_value(request, "X-Real-IP");  
-        char *cfip = find_header_value(request, "CF-Connecting-IP");  
-          
-        // 构建合并的消息  
-        char proxy_info[1024] = {0};  
-        int has_proxy_header = 0;  
-          
-        if (xff || xri || cfip) {  
-            strcat(proxy_info, "代理信息: ");  
-              
-            if (xff) {  
-                char xff_value[256];  
-                sscanf(xff, "%255[^\r\n]", xff_value);  
-                strcat(proxy_info, "X-Forwarded-For=");  
-                strcat(proxy_info, xff_value);  
-                has_proxy_header = 1;  
-            }  
-              
-            if (xri) {  
-                char xri_value[256];  
-                sscanf(xri, "%255[^\r\n]", xri_value);  
-                if (has_proxy_header) strcat(proxy_info, ", ");  
-                strcat(proxy_info, "X-Real-IP=");  
-                strcat(proxy_info, xri_value);  
-                has_proxy_header = 1;  
-            }  
-              
-            if (cfip) {  
-                char cfip_value[256];  
-                sscanf(cfip, "%255[^\r\n]", cfip_value);  
-                if (has_proxy_header) strcat(proxy_info, ", ");  
-                strcat(proxy_info, "CF-Connecting-IP=");  
-                strcat(proxy_info, cfip_value);  
-            }  
+
+        // 查找代理请求头
+        char *xff = find_header_value(request, "X-Forwarded-For");
+        char *xri = find_header_value(request, "X-Real-IP");
+        char *cfip = find_header_value(request, "CF-Connecting-IP");
+
+        // 构建合并的消息
+        char proxy_info[1024] = {0};
+        int has_proxy_header = 0;
+
+        if (xff || xri || cfip)
+        {
+            strcat(proxy_info, "代理信息: ");
+
+            if (xff)
+            {
+                char xff_value[256];
+                sscanf(xff, "%255[^\r\n]", xff_value);
+                strcat(proxy_info, "X-Forwarded-For=");
+                strcat(proxy_info, xff_value);
+                has_proxy_header = 1;
+            }
+
+            if (xri)
+            {
+                char xri_value[256];
+                sscanf(xri, "%255[^\r\n]", xri_value);
+                if (has_proxy_header)
+                    strcat(proxy_info, ", ");
+                strcat(proxy_info, "X-Real-IP=");
+                strcat(proxy_info, xri_value);
+                has_proxy_header = 1;
+            }
+
+            if (cfip)
+            {
+                char cfip_value[256];
+                sscanf(cfip, "%255[^\r\n]", cfip_value);
+                if (has_proxy_header)
+                    strcat(proxy_info, ", ");
+                strcat(proxy_info, "CF-Connecting-IP=");
+                strcat(proxy_info, cfip_value);
+            }
             if (verbose)
-    		{ 
-            	// 输出合并后的消息  
-            	fprintf(stderr, "[%s] [DEBUG]: %s\n", timestamp(), proxy_info); 
-			}
-        }  
+            {
+                // 输出合并后的消息
+                fprintf(stderr, "[%s] [DEBUG]: %s\n", timestamp(), proxy_info);
+            }
+        }
 
         // 解析请求行: GET /api?supernode=host:port HTTP/1.1
         char method[16], path[512], version[16];
@@ -3678,29 +3876,55 @@ void handle_http_request(int client_sock)
             }
         }
 
-        char *response = malloc(262144); // 256KB
+        // ========== 动态缓冲区分配 ==========
+        pthread_mutex_lock(&g_state.lock);
+
+        // 基础大小: HTTP 头 + HTML 框架
+        size_t base_size = 50000;
+
+        // 每个主机预估大小: 表格行 + 历史记录数据
+        // 表格行约 500 字节 + 历史记录 (每条约 50 字节)
+        size_t per_host_size = 500 + (g_max_history * 50);
+
+        // 总大小 = 基础 + (主机数 × 每主机大小) + 安全余量
+        size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;
+
+        // 设置最小值和最大值
+        if (buffer_size < 262144)
+            buffer_size = 262144; // 最小 256KB
+        if (buffer_size > 10485760)
+            buffer_size = 10485760; // 最大 10MB
+
+        int host_count = g_state.host_count;
+        pthread_mutex_unlock(&g_state.lock);
+
+        char *response = malloc(buffer_size);
         if (response)
         {
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 开始生成 HTML 内容\n", timestamp());
+                fprintf(stderr, "[%s] [DEBUG]: 分配 %zu 字节缓冲区 (主机数: %d, 历史记录: %d)\n",
+                        timestamp(), buffer_size, host_count, g_max_history);
             }
 
-            generate_html(response, 262144);
+            generate_html(response, buffer_size);
+
+            // ========== 使用分块传输 ==========
             size_t response_len = strlen(response);
-            ssize_t sent = send(client_sock, response, response_len, 0);
+            send_chunked_response(client_sock, response, response_len);
 
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 发送响应: %zd/%zu 字节\n", timestamp(), sent, response_len);
+                fprintf(stderr, "[%s] [DEBUG]: 响应发送完成: %zu 字节\n", timestamp(), response_len);
             }
+
             free(response);
         }
         else
         {
             if (verbose)
             {
-                fprintf(stderr, "[%s] [ERROR]: 响应缓冲区分配失败\n", timestamp());
+                fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓冲区\n", timestamp(), buffer_size);
             }
         }
     }
@@ -3725,7 +3949,6 @@ void handle_http_request(int client_sock)
         fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());
     }
 }
-
 // 监控线程
 void *monitor_thread(void *arg)
 {
@@ -3927,38 +4150,45 @@ void *monitor_thread(void *arg)
     return NULL;
 }
 
-// 人类可读格式转换  
-static void format_size(size_t bytes, char *output, size_t output_size) {  
-    const char *units[] = {"B", "K", "M", "G", "T"};  
-    int unit_index = 0;  
-    double size = (double)bytes;  
-      
-    while (size >= 1024.0 && unit_index < 4) {  
-        size /= 1024.0;  
-        unit_index++;  
-    }  
-      
-    if (unit_index == 0) {  
-        snprintf(output, output_size, "%zu%s", bytes, units[unit_index]);  
-    } else {  
-        snprintf(output, output_size, "%.2f%s", size, units[unit_index]);  
-    }  
-}  
-  
-// 计算总存储大小  
-static size_t calculate_total_storage_size(void) {  
-    size_t total = 0;  
-      
-    for (int i = 0; i < g_state.host_count; i++) {  
-        host_stats_t *h = &g_state.hosts[i];  
-        // 每个主机的存储大小  
-        size_t host_size = sizeof(int) * 2 +  // history_index + history_count  
-                          sizeof(check_record_t) * h->max_history +  // history数组  
-                          sizeof(int) * 5;  // total_checks + success_v1/v2/v2s/v3  
-        total += host_size;  
-    }  
-      
-    return total;  
+// 人类可读格式转换
+static void format_size(size_t bytes, char *output, size_t output_size)
+{
+    const char *units[] = {"B", "K", "M", "G", "T"};
+    int unit_index = 0;
+    double size = (double)bytes;
+
+    while (size >= 1024.0 && unit_index < 4)
+    {
+        size /= 1024.0;
+        unit_index++;
+    }
+
+    if (unit_index == 0)
+    {
+        snprintf(output, output_size, "%zu%s", bytes, units[unit_index]);
+    }
+    else
+    {
+        snprintf(output, output_size, "%.2f%s", size, units[unit_index]);
+    }
+}
+
+// 计算总存储大小
+static size_t calculate_total_storage_size(void)
+{
+    size_t total = 0;
+
+    for (int i = 0; i < g_state.host_count; i++)
+    {
+        host_stats_t *h = &g_state.hosts[i];
+        // 每个主机的存储大小
+        size_t host_size = sizeof(int) * 2 +                         // history_index + history_count
+                           sizeof(check_record_t) * h->max_history + // history数组
+                           sizeof(int) * 5;                          // total_checks + success_v1/v2/v2s/v3
+        total += host_size;
+    }
+
+    return total;
 }
 
 // 信号处理函数 - 保存所有历史记录后退出
@@ -4004,7 +4234,7 @@ static void print_help(const char *prog_name)
     printf("  -r <分钟>       指定主页手动刷新探测间隔时间（分钟）(默认: 1)\n");
     printf("  -t <秒>         指定检测超时时间未响应则判定离线（秒）(默认: 1)\n");
     printf("  -z <次数>       指定检测超时失败后的最大重试次数 (默认: 5)\n");
-    printf("  -j <数量>       最大历史记录数量 (默认: 300)\n");  
+    printf("  -j <数量>       最大历史记录数量 (默认: 300)\n");
     printf("  -d <路径>       历史检测记录保存的目录 (默认: /tmp/n2n_monitor)\n");
     printf("  -f <文件>       从指定的文件读取主机列表(一行一个，支持备注)\n");
     printf("  -c <社区名>     指定探测使用的社区名称 (默认: N2N_check_bot)\n");
@@ -4038,10 +4268,11 @@ int main(int argc, char *argv[])
     int use_ipv6 = 0; // 默认仅 IPv4
     int original_stderr = -1;
 
-    // 如果没有任何参数,显示帮助信息  
-    if (argc == 1) {  
-        print_help(argv[0]);  
-        return 0;  
+    // 如果没有任何参数,显示帮助信息
+    if (argc == 1)
+    {
+        print_help(argv[0]);
+        return 0;
     }
     // 解析命令行参数
     while (arg_start < argc)
@@ -4093,8 +4324,8 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 检测间隔时间: %d秒\n",
-                        timestamp(), check_interval);
+            fprintf(stderr, "[%s] [DEBUG]: 检测间隔时间: %d分钟\n",
+                    timestamp(), check_interval);
             // }
         }
         else if (strcmp(argv[arg_start], "-t") == 0 && arg_start + 1 < argc)
@@ -4110,24 +4341,25 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 检测超时时间: %d秒 (%ldms)\n",
-                        timestamp(), timeout_sec, g_timeout_ms);
+            fprintf(stderr, "[%s] [DEBUG]: 检测超时时间: %d秒 (%ldms)\n",
+                    timestamp(), timeout_sec, g_timeout_ms);
             // }
         }
-        else if (strcmp(argv[arg_start], "-z") == 0 && arg_start + 1 < argc)  
-	{  
-    		g_max_retries = atoi(argv[arg_start + 1]);  
-    		if (g_max_retries <= 0 || g_max_retries > 20) {  
-        		fprintf(stderr, "[%s] [ERROR]: 无效的重试次数 %d (范围: 1-20)\n",   
-                		timestamp(), g_max_retries);  
-        		return 1;  
-    		}  
-    		arg_start += 2;  
-    		// if (verbose) {  
-        		fprintf(stderr, "[%s] [DEBUG]: 检测超时最大重试次数: %d 次\n",   
-                		timestamp(), g_max_retries);  
-    		// }  
-	}
+        else if (strcmp(argv[arg_start], "-z") == 0 && arg_start + 1 < argc)
+        {
+            g_max_retries = atoi(argv[arg_start + 1]);
+            if (g_max_retries <= 0 || g_max_retries > 20)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 无效的重试次数 %d (范围: 1-20)\n",
+                        timestamp(), g_max_retries);
+                return 1;
+            }
+            arg_start += 2;
+            // if (verbose) {
+            fprintf(stderr, "[%s] [DEBUG]: 检测超时最大重试次数: %d 次\n",
+                    timestamp(), g_max_retries);
+            // }
+        }
         else if (strcmp(argv[arg_start], "-r") == 0 && arg_start + 1 < argc)
         {
             manual_refresh_interval = atoi(argv[arg_start + 1]);
@@ -4139,36 +4371,37 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 主页手动刷新间隔时间: %d秒\n",
-                        timestamp(), manual_refresh_interval);
+            fprintf(stderr, "[%s] [DEBUG]: 主页手动刷新间隔时间: %d秒\n",
+                    timestamp(), manual_refresh_interval);
             // }
         }
-        else if (strcmp(argv[arg_start], "-j") == 0 && arg_start + 1 < argc)  
-	{  
-    		g_max_history = atoi(argv[arg_start + 1]);  
-    		if (g_max_history <= 0 || g_max_history > 10000) {  
-        		fprintf(stderr, "[%s] [ERROR]: 无效的历史检测记录数量 %d (范围: 1-10000)\n",   
-                		timestamp(), g_max_history);  
-        		return 1;  
-    		}  
-    		arg_start += 2; 
-    		if (verbose)
-            	{
-                	fprintf(stderr, "[%s] [DEBUG]: 最大历史检测记录保存数量: %d条\n",
+        else if (strcmp(argv[arg_start], "-j") == 0 && arg_start + 1 < argc)
+        {
+            g_max_history = atoi(argv[arg_start + 1]);
+            if (g_max_history <= 0 || g_max_history > 10000)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 无效的历史检测记录数量 %d (范围: 1-10000)\n",
                         timestamp(), g_max_history);
-            	} 
-	}  
-	else if (strcmp(argv[arg_start], "-d") == 0 && arg_start + 1 < argc)  
-	{  
-    		strncpy(g_state_dir, argv[arg_start + 1], sizeof(g_state_dir) - 1);  
-    		g_state_dir[sizeof(g_state_dir) - 1] = '\0';  
-    		arg_start += 2; 
-    		if (verbose)
-            	{
-                	fprintf(stderr, "[%s] [DEBUG]: 历史检测记录保存路径: %s\n",
+                return 1;
+            }
+            arg_start += 2;
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 最大历史检测记录保存数量: %d条\n",
+                        timestamp(), g_max_history);
+            }
+        }
+        else if (strcmp(argv[arg_start], "-d") == 0 && arg_start + 1 < argc)
+        {
+            strncpy(g_state_dir, argv[arg_start + 1], sizeof(g_state_dir) - 1);
+            g_state_dir[sizeof(g_state_dir) - 1] = '\0';
+            arg_start += 2;
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 历史检测记录保存路径: %s\n",
                         timestamp(), g_state_dir);
-            	}  
-	}
+            }
+        }
         else if (strcmp(argv[arg_start], "-f") == 0 && arg_start + 1 < argc)
         {
             config_file = argv[arg_start + 1];
@@ -4176,7 +4409,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 使用的主机列表文件: %s\n", timestamp(), config_file);
+            fprintf(stderr, "[%s] [DEBUG]: 使用的主机列表文件: %s\n", timestamp(), config_file);
             // }
         }
         else if (strcmp(argv[arg_start], "-c") == 0 && arg_start + 1 < argc)
@@ -4186,7 +4419,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 探测使用的社区名: %s\n", timestamp(), g_community);
+            fprintf(stderr, "[%s] [DEBUG]: 探测使用的社区名: %s\n", timestamp(), g_community);
             // }
         }
         else if (strcmp(argv[arg_start], "-m") == 0 && arg_start + 1 < argc)
@@ -4200,8 +4433,8 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-                fprintf(stderr, "[%s] [DEBUG]: 探测使用的 MAC 地址: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                        timestamp(), g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
+            fprintf(stderr, "[%s] [DEBUG]: 探测使用的 MAC 地址: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                    timestamp(), g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
             // }
         }
         else if (strcmp(argv[arg_start], "-4") == 0)
@@ -4312,7 +4545,7 @@ int main(int argc, char *argv[])
             }
         }
     }
-    
+
     // 读取配置文件
     if (config_file)
     {
@@ -4462,16 +4695,17 @@ int main(int argc, char *argv[])
         h->port = port;
         strncpy(h->note, note, sizeof(h->note) - 1);
         strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);
-        
-        // 初始化 max_history 并分配内存  
-	h->max_history = g_max_history;  
-	h->history = calloc(g_max_history, sizeof(check_record_t));  
-	if (!h->history) {  
-    		fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",  
-            		timestamp(), host_str, port);  
-    		free(host_str);  
-    		continue;  
-	}
+
+        // 初始化 max_history 并分配内存
+        h->max_history = g_max_history;
+        h->history = calloc(g_max_history, sizeof(check_record_t));
+        if (!h->history)
+        {
+            fprintf(stderr, "[%s] [ERROR]: 无法为 %s:%d 分配历史记录内存，跳过这个主机\n",
+                    timestamp(), host_str, port);
+            free(host_str);
+            continue;
+        }
 
         load_history(h);
         g_state.host_count++;
@@ -4495,16 +4729,16 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    //printf("[%s] [INFO]: 共计检测 %d 个主机\n", timestamp(), g_state.host_count);
-    // 计算并输出存储信息  
-    size_t total_size = calculate_total_storage_size();  
-    char size_str[64];  
-    format_size(total_size, size_str, sizeof(size_str));  
-  
-    fprintf(stderr, "[%s] [INFO]: 历史检测记录配置:\n", timestamp());  
-    fprintf(stderr, "[%s] [INFO]:   - 保存路径: %s\n", timestamp(), g_state_dir);  
-    fprintf(stderr, "[%s] [INFO]:   - 最大记录数: %d 条/主机\n", timestamp(), g_max_history);  
-    fprintf(stderr, "[%s] [INFO]:   - 主机数量: %d 个\n", timestamp(), g_state.host_count);  
+    // printf("[%s] [INFO]: 共计检测 %d 个主机\n", timestamp(), g_state.host_count);
+    //  计算并输出存储信息
+    size_t total_size = calculate_total_storage_size();
+    char size_str[64];
+    format_size(total_size, size_str, sizeof(size_str));
+
+    fprintf(stderr, "[%s] [INFO]: 历史检测记录配置:\n", timestamp());
+    fprintf(stderr, "[%s] [INFO]:   - 保存路径: %s\n", timestamp(), g_state_dir);
+    fprintf(stderr, "[%s] [INFO]:   - 最大记录数: %d 条/主机\n", timestamp(), g_max_history);
+    fprintf(stderr, "[%s] [INFO]:   - 主机数量: %d 个\n", timestamp(), g_state.host_count);
     fprintf(stderr, "[%s] [INFO]:   - 预计占用: %s\n", timestamp(), size_str);
 
     // 初始化 HTTP 服务器 (支持 IPv4/IPv6)
@@ -4621,19 +4855,19 @@ int main(int argc, char *argv[])
         {
             if (verbose)
             {
-            	char client_ip[INET6_ADDRSTRLEN];
-            	if (client_addr.ss_family == AF_INET)
-            	{
-                	inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
-                          client_ip, sizeof(client_ip));
-                	fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
-            	}
-            	else if (client_addr.ss_family == AF_INET6)
-            	{
-                	inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
-                          client_ip, sizeof(client_ip));
-                	fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
-            	}
+                char client_ip[INET6_ADDRSTRLEN];
+                if (client_addr.ss_family == AF_INET)
+                {
+                    inet_ntop(AF_INET, &((struct sockaddr_in *)&client_addr)->sin_addr,
+                              client_ip, sizeof(client_ip));
+                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
+                }
+                else if (client_addr.ss_family == AF_INET6)
+                {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&client_addr)->sin6_addr,
+                              client_ip, sizeof(client_ip));
+                    fprintf(stderr, "[%s] [DEBUG]: 来自 [%s] 访问\n", timestamp(), client_ip);
+                }
             }
             handle_http_request(client_sock);
         }
