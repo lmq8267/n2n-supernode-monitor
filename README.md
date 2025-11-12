@@ -12,19 +12,17 @@ N2N supernode 检测工具
 
 选项:
   -p <端口>       服务主页监听端口 (默认: 8585)
-  -i <分钟>       指定自动探测间隔时间（分钟）(默认: 1)
-  -r <分钟>       指定主页手动刷新探测间隔时间（分钟）(默认: 1)
-  -t <秒>         指定检测超时时间未响应则判定离线（秒）(默认: 1)
-  -z <次数>       指定检测超时失败后的最大重试次数 (默认: 5)
-  -j <数量>       最大历史记录数量 (默认: 300)
-  -d <路径>       历史检测记录保存的目录 (默认: /tmp/n2n_monitor)
+  -i <分钟>       自动探测间隔时间（分钟）(默认: 1)
+  -r <分钟>       允许主页里手动探测的间隔时间（分钟）(默认: 1)
+  -t <秒>         探测超时时间（秒）(默认: 1)
+  -z <次数>       探测超时或失败后最大重试次数 (默认: 5)
+  -j <数量>       保存历史检测记录条数 (默认: 300条/主机)
+  -d <路径>       历史检测记录保存目录 (默认: /tmp/n2n_monitor)
   -f <文件>       从指定的文件读取主机列表(一行一个，支持备注)
-  -c <社区名>     指定探测使用的社区名称 (默认: N2N_check_bot)
-  -m <MAC地址>    指定探测使用的MAC地址,格式: a1:b2:c3:d4:f5:06 (默认: a1:b2:c3:d4:f5:06)
-  -4              服务主页仅监听 IPv4 (默认)
-  -6              服务主页同时监听 IPv4 和 IPv6
-  -s              启用输出到系统日志 (默认启用)
-  --no-syslog     禁用输出到系统日志
+  -c <社区名>     探测使用的社区名称 (默认: N2N_check_bot)
+  -m <MAC地址>    探测使用的MAC地址 (默认: a1:b2:c3:d4:f5:06)
+  -6              服务主页启用 IPv6 支持
+  -s              启用输出到系统日志
   -v              详细模式（显示调试信息）
   -h              显示此帮助信息
 
@@ -33,12 +31,12 @@ N2N supernode 检测工具
   例如: n2n.example.com:10086|北京电信|隐私.com
 
 命令示例:
-  ./n2n_check_http -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090
-  ./n2n_check_http -v -6 "supernode.example.com:7777|北京电信" "192.168.1.1:10090|自建"
-  ./n2n_check_http -p 8080 -i 2 -f n2n_host.conf
+  ./n2n_check_http -s -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090
+  ./n2n_check_http -s -v -6 "supernode.example.com:7777|北京电信" "192.168.1.1:10090|自建"
+  ./n2n_check_http -s -p 8080 -i 2 -f n2n_host.conf
 ```
 
-- 命令行添加备注需要英文的双引号 `"` 包裹才行，配置文件则无需双引号
+- 命令行添加备注需要英文的双引号 `""` 包裹才行，配置文件则无需双引号
 - 主机列表文件一行一个服务器 `#` 为注释不会解析，`|` 为分隔备注使用的
 
 主机列表文件示例：
@@ -67,12 +65,12 @@ http:n2n.example.com|重定向记录版
 
 ```
 # 采用主机列表文件并后台运行
-nohup ./n2n_check_http -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
+nohup ./n2n_check_http -s -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
 ```
 - 在openwrt里因为时区问题 可能需要指定时区启动 如 `TZ=utc-8`
 
 ```
-TZ=utc-8 ./n2n_check_http -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
+TZ=utc-8 ./n2n_check_http -s -p 8585 -i 5 -f /etc/n2n_hosts.conf > /dev/null 2>&1 &
 ```
 
 #### ② systemd 服务： 
@@ -86,7 +84,7 @@ After=network.target
   
 [Service]  
 Type=simple  
-ExecStart=/usr/local/bin/n2n_check_http -p 8585 -i 5 -f /etc/n2n_hosts.conf  
+ExecStart=/usr/local/bin/n2n_check_http -s -p 8585 -i 5 -f /etc/n2n_hosts.conf  
 StandardOutput=journal    
 StandardError=journal  
 Restart=always  
