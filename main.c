@@ -29,7 +29,7 @@
 #define MSG_TYPE_REGISTER_ACK 4
 #define MAX_HOSTS 100
 
-static int g_enable_syslog = 1;                     // 输出日志到系统日志，默认启用
+static int g_enable_syslog = 0;                     // 输出日志到系统日志
 static int g_syslog_pipe[2];                        // 管道文件描述符
 static pthread_t g_syslog_thread;                   // syslog 转发线程
 static int g_syslog_running = 0;                    // 线程运行标志
@@ -4238,11 +4238,9 @@ static void print_help(const char *prog_name)
     printf("  -d <路径>       历史检测记录保存目录 (默认: /tmp/n2n_monitor)\n");
     printf("  -f <文件>       从指定文件读取主机列表(一行一个，支持备注)\n");
     printf("  -c <社区名>     探测使用的社区名称 (默认: N2N_check_bot)\n");
-    printf("  -m <MAC地址>    探测使用的MAC地址,格式: a1:b2:c3:d4:f5:06 (默认: a1:b2:c3:d4:f5:06)\n");
-    printf("  -4              服务主页仅监听 IPv4 (默认)\n");
-    printf("  -6              服务主页同时监听 IPv4 和 IPv6\n");
-    printf("  -s              启用输出到系统日志 (默认启用)\n");
-    printf("  --no-syslog     禁用输出到系统日志\n");
+    printf("  -m <MAC地址>    探测使用的MAC地址 (默认: a1:b2:c3:d4:f5:06)\n");
+    printf("  -6              服务主页启用 IPv6 支持\n");
+    printf("  -s              启用输出到系统日志\n");
     printf("  -v              详细模式（显示调试信息）\n");
     printf("  -h              显示此帮助信息\n\n");
     printf("主机列表文件格式:\n");
@@ -4296,12 +4294,6 @@ int main(int argc, char *argv[])
             g_enable_syslog = 1;
             arg_start++;
             fprintf(stderr, "[%s] [INFO]: 系统日志输出已启用\n", timestamp());
-        }
-        else if (strcmp(argv[arg_start], "--no-syslog") == 0)
-        {
-            g_enable_syslog = 0;
-            arg_start++;
-            fprintf(stderr, "[%s] [INFO]: 系统日志输出已禁用\n", timestamp());
         }
         else if (strcmp(argv[arg_start], "-p") == 0 && arg_start + 1 < argc)
         {
@@ -4437,22 +4429,13 @@ int main(int argc, char *argv[])
                     timestamp(), g_mac[0], g_mac[1], g_mac[2], g_mac[3], g_mac[4], g_mac[5]);
             // }
         }
-        else if (strcmp(argv[arg_start], "-4") == 0)
-        {
-            use_ipv6 = 0;
-            arg_start++;
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: 仅使用 IPv4\n", timestamp());
-            }
-        }
         else if (strcmp(argv[arg_start], "-6") == 0)
         {
             use_ipv6 = 1;
             arg_start++;
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 启用 IPv4 和 IPv6 支持\n", timestamp());
+                fprintf(stderr, "[%s] [DEBUG]: 启用 IPv6 支持\n", timestamp());
             }
         }
         else
