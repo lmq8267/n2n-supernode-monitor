@@ -73,7 +73,7 @@ http:n2n.example.com|重定向记录版
 # 程序传入的第一个是参数 主机
 host="$1"
 
-# 传入的第二个是参数 版本 如果离线的话是 Unknown
+# 传入的第二个是参数 版本(v1 v2 v2s v3) 如果离线的话是 Unknown
 version="$2"
 
 # 传入的第三个是参数 up 或 down
