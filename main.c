@@ -18,6 +18,7 @@
 #include <arpa/nameser.h>
 #include <signal.h>
 #include <ctype.h>
+#include <sys/wait.h>
 
 #define N2N_COMMUNITY_SIZE 20
 #define N2N_MAC_SIZE 6
@@ -39,6 +40,8 @@ static long g_timeout_ms = 1000;                    // 默认 1000ms (1秒)未�
 static int g_max_retries = 5;                       // 默认5次 检测重试次数
 static int g_max_history = 300;                     // 默认300条 保存的最大历史检测记录
 static char g_state_dir[1024] = "/tmp/n2n_monitor"; // 默认历史检测记录保存路径
+static char g_callback_script[1024] = "";           // 回调脚本路径
+
 static int verbose = 0;
 static char g_community[N2N_COMMUNITY_SIZE] = "N2N_check_bot";
 static uint8_t g_mac[N2N_MAC_SIZE] = {0xa1, 0xb2, 0xc3, 0xd4, 0xf5, 0x06}; // a1:b2:c3:d4:f5:06
@@ -69,6 +72,7 @@ typedef struct
     int history_index;       // 当前写入位置
     int history_count;       // 已有记录数
     int max_history;         // 记录该主机的最大历史数
+    int last_online_status;  // 0=离线, 1=在线, -1=未初始化
 } host_stats_t;
 
 typedef struct
@@ -1072,6 +1076,7 @@ static void load_config(const char *config_file)
         h->port = port;
         strncpy(h->note, note, sizeof(h->note) - 1);
         strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);
+        h->last_online_status = -1;
 
         if (verbose)
         {
@@ -3594,6 +3599,95 @@ void handle_api_request(int client_sock, const char *path)
     generate_svg_response(client_sock, result == 0, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);
 }
 
+static void call_status_change_script(host_stats_t *h, int is_online,
+                                      int v1_ok, int v2_ok, int v2s_ok, int v3_ok)
+{
+    // 检查脚本是否存在且有执行权限  
+    if (access(g_callback_script, X_OK) != 0)  
+    {  
+        fprintf(stderr, "[%s] [ERROR]: %s 状态变化，脚本 %s 不存在或无执行权限: %s\n",  
+                timestamp(), h->host, g_callback_script, strerror(errno));  
+        return;  
+    }
+    // 构建版本字符串,防止为空
+    char versions[64] = "";
+    int has_version = 0;
+    if (v1_ok)
+    {
+        strcat(versions, "v1 ");
+        has_version = 1;
+    }
+    if (v2_ok)
+    {
+        strcat(versions, "v2 ");
+        has_version = 1;
+    }
+    if (v2s_ok)
+    {
+        strcat(versions, "v2s ");
+        has_version = 1;
+    }
+    if (v3_ok)
+    {
+        strcat(versions, "v3 ");
+        has_version = 1;
+    }
+
+    // 如果没有检测到任何版本,使用占位符
+    if (!has_version)
+    {
+        strcpy(versions, "Unknown");
+    }
+
+    // 构建主机标识 - 使用真实主机名(h->host),不使用隐私名(display_name)
+    char host_id[512];
+    if (h->port > 0)
+        snprintf(host_id, sizeof(host_id), "%s:%d", h->host, h->port);
+    else
+        snprintf(host_id, sizeof(host_id), "%s", h->host);
+
+    // 构建命令
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "%s \"%s\" \"%s\" \"%s\"",
+             g_callback_script, host_id, versions, is_online ? "up" : "down");
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: %s 状态变化，调用脚本: %s\n", timestamp(), host_id, cmd);
+    }
+
+    // 双重 fork 避免僵尸进程
+    pid_t pid = fork();
+    if (pid == 0)
+    {
+        // 第一个子进程立即再 fork
+        if (fork() == 0)
+        {
+            // 孙进程执行脚本,先尝试 /bin/sh
+            execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+            // 如果 /bin/sh 失败,尝试 /bin/bash
+            execl("/bin/bash", "bash", "-c", cmd, (char *)NULL);
+            // 如果都失败,退出子进程
+            exit(1);
+        }
+        // 第一个子进程立即退出
+        exit(0);
+    }
+    else if (pid > 0)
+    {
+        // 父进程等待第一个子进程(很快就会退出)
+        waitpid(pid, NULL, 0);
+    }
+    else
+    {
+        // fork 失败
+        // if (verbose)
+        // {
+        fprintf(stderr, "[%s] [ERROR]: %s 状态变化，调用脚本时 fork() 失败: %s 无法执行\n", timestamp(), host_id, strerror(errno));
+        // }
+    }
+}
+
 void handle_refresh_request(int client_sock)
 {
     time_t now = time(NULL);
@@ -3743,6 +3837,17 @@ void handle_refresh_request(int client_sock)
         h->last_check = time(NULL);
 
         int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);
+        
+        // 检测状态变化
+        if (g_callback_script[0] != '\0' && h->last_online_status != is_online)
+        {
+                // 避免首次检测时就是在线的情况触发  
+    		if (h->last_online_status != -1 || !is_online)
+                {
+                    call_status_change_script(h, is_online, v1_ok, v2_ok, v2s_ok, v3_ok);
+                }
+        }
+        h->last_online_status = is_online;
         add_check_record(h, is_online);
         snprintf(h->last_status, sizeof(h->last_status),
                  is_online ? "✓ 在线" : "✗ 离线");
@@ -3949,6 +4054,7 @@ void handle_http_request(int client_sock)
         fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());
     }
 }
+
 // 监控线程
 void *monitor_thread(void *arg)
 {
@@ -4085,6 +4191,17 @@ void *monitor_thread(void *arg)
 
             // 【新增】判断本次检测是否在线(任一版本成功即为在线)
             int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);
+            
+            // 检测状态变化
+            if (g_callback_script[0] != '\0' && h->last_online_status != is_online)
+            {
+                // 避免首次检测时就是在线的情况触发  
+    		if (h->last_online_status != -1 || !is_online)
+                {
+                    call_status_change_script(h, is_online, v1_ok, v2_ok, v2s_ok, v3_ok);
+                }
+            }
+            h->last_online_status = is_online;
 
             // 【新增】添加检测记录到历史数组
             add_check_record(h, is_online);
@@ -4231,12 +4348,13 @@ static void print_help(const char *prog_name)
     printf("选项:\n");
     printf("  -p <端口>       服务主页监听端口 (默认: 8585)\n");
     printf("  -i <分钟>       自动探测间隔时间 (默认: 1)\n");
-    printf("  -r <分钟>       允许主页里手动探测的间隔时间 (默认: 1)\n");
+    printf("  -r <分钟>       允许主页里手动探测的最小间隔时间 (默认: 1)\n");
     printf("  -t <秒>         探测超时时间 (默认: 1)\n");
     printf("  -z <次数>       探测超时或失败后最大重试次数 (默认: 5)\n");
     printf("  -j <数量>       保存历史检测记录条数 (默认: 300条/主机)\n");
     printf("  -d <路径>       历史检测记录保存目录 (默认: /tmp/n2n_monitor)\n");
-    printf("  -f <文件>       从指定文件读取主机列表(一行一个，支持备注)\n");
+    printf("  -f <文件>       从指定文件读取主机列表 (一行一个，支持备注)\n");
+    printf("  -w <文件>       探测时当主机状态发生变化后调用的脚本\n");
     printf("  -c <社区名>     探测使用的社区名称 (默认: N2N_check_bot)\n");
     printf("  -m <MAC地址>    探测使用的MAC地址 (默认: a1:b2:c3:d4:f5:06)\n");
     printf("  -6              服务主页启用 IPv6 支持\n");
@@ -4246,6 +4364,10 @@ static void print_help(const char *prog_name)
     printf("主机列表文件格式:\n");
     printf("  host:port|备注|主页展示的主机名\n");
     printf("  例如: n2n.example.com:10086|北京电信|隐私.com\n\n");
+    printf("回调脚本传递参数:\n");
+    printf("  主机(host:port) 版本(v1 v2 v2s v3 Unknown) 状态(up down)\n");
+    printf("  例如: script_file.sh n2n.example.com:10086 v1 up\n");
+    printf("  例如: script_file.sh n2n.example.com:10082 Unknown down\n\n");
     printf("命令示例:\n");
     printf("  %s -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090\n", prog_name);
     printf("  %s -v -6 \"supernode.example.com:7777|北京电信\" \"192.168.1.1:10090|自建\"\n", prog_name);
@@ -4316,7 +4438,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-            fprintf(stderr, "[%s] [DEBUG]: 检测间隔时间: %d分钟\n",
+            fprintf(stderr, "[%s] [DEBUG]: 自动检测间隔时间: %d分钟\n",
                     timestamp(), check_interval);
             // }
         }
@@ -4363,7 +4485,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-            fprintf(stderr, "[%s] [DEBUG]: 主页手动刷新间隔时间: %d秒\n",
+            fprintf(stderr, "[%s] [DEBUG]: 主页手动检测最小间隔时间: %d秒\n",
                     timestamp(), manual_refresh_interval);
             // }
         }
@@ -4379,7 +4501,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 最大历史检测记录保存数量: %d条\n",
+                fprintf(stderr, "[%s] [DEBUG]: 最大历史检测记录保存数量: %d条/主机\n",
                         timestamp(), g_max_history);
             }
         }
@@ -4401,8 +4523,37 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-            fprintf(stderr, "[%s] [DEBUG]: 使用的主机列表文件: %s\n", timestamp(), config_file);
+            fprintf(stderr, "[%s] [DEBUG]: 主机列表文件: %s\n", timestamp(), config_file);
             // }
+        }
+        else if (strcmp(argv[arg_start], "-w") == 0 && arg_start + 1 < argc)
+        {
+            strncpy(g_callback_script, argv[arg_start + 1], sizeof(g_callback_script) - 1);
+            g_callback_script[sizeof(g_callback_script) - 1] = '\0';
+            // 验证脚本  
+            if (access(g_callback_script, F_OK) != 0)  
+            {  
+            	fprintf(stderr, "[%s] [ERROR]: 回调脚本不存在: %s\n",   
+                	timestamp(), g_callback_script);  
+        	return 1;  
+            }  
+            else if (access(g_callback_script, X_OK) != 0)  
+            {  
+        	fprintf(stderr, "[%s] [ERROR]: 回调脚本无执行权限: %s\n",   
+                	timestamp(), g_callback_script);  
+        	fprintf(stderr, "[%s] [INFO]: 请运行: chmod +x %s\n",   
+                	timestamp(), g_callback_script);  
+        	return 1;  
+            }  
+            else  
+            {  
+            	// if (verbose)
+            	// {
+        		fprintf(stderr, "[%s] [INFO]: 回调脚本已配置: %s\n",   
+                		timestamp(), g_callback_script);  
+            	// }
+            }  
+            arg_start += 2;  
         }
         else if (strcmp(argv[arg_start], "-c") == 0 && arg_start + 1 < argc)
         {
@@ -4499,6 +4650,7 @@ int main(int argc, char *argv[])
     g_state.check_interval_minutes = check_interval;
     g_state.start_time = time(NULL);
     g_state.running = 1;
+    
     // 注册信号处理函数
     signal(SIGTERM, signal_handler); // kill 命令
     signal(SIGINT, signal_handler);  // Ctrl+C
@@ -4678,6 +4830,7 @@ int main(int argc, char *argv[])
         h->port = port;
         strncpy(h->note, note, sizeof(h->note) - 1);
         strncpy(h->display_name, display_name, sizeof(h->display_name) - 1);
+        h->last_online_status = -1;
 
         // 初始化 max_history 并分配内存
         h->max_history = g_max_history;
