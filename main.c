@@ -4316,7 +4316,7 @@ void handle_http_request(int client_sock)
     {
         fprintf(stderr, "[%s] [DEBUG]: 开始处理 HTTP 请求 (socket fd=%d)\n", timestamp(), client_sock);
     }
-    char request[1024];
+    char request[2048];
     ssize_t n = recv(client_sock, request, sizeof(request) - 1, 0);
     if (verbose)
     {
@@ -4333,7 +4333,7 @@ void handle_http_request(int client_sock)
         char *cfip = find_header_value(request, "CF-Connecting-IP");
 
         // 构建合并的消息
-        char proxy_info[1024] = {0};
+        char proxy_info[2048] = {0};
         int has_proxy_header = 0;
 
         if (xff || xri || cfip)
