@@ -2249,8 +2249,11 @@ void generate_html(char *buf, size_t bufsize)
     char time_str[128];
     strftime(time_str, sizeof(time_str), "%Y年%m月%d日 %H时%M分%S秒", tm_info);
 
-    // 页面刷新间隔等于检测间隔(秒)
+    // 页面刷新间隔等于检测间隔(秒),但最小为15分钟 
     int refresh_seconds = g_state.check_interval_minutes * 60;
+    if (refresh_seconds < 900) {  
+        refresh_seconds = 900;  // 最小15分钟  
+    }
 
     int len = snprintf(buf, bufsize,
                        "<!DOCTYPE html>\n"
