@@ -5087,6 +5087,22 @@ void signal_handler(int signum)
 
     exit(0);
 }
+
+static int calculate_min_interval(int host_count, int parallel_checks)  
+{  
+    // 保守估计：每个主机平均 2 秒（考虑重试）  
+    int avg_check_time_sec = 2;  
+      
+    // 计算最小间隔（秒）  
+    int min_interval_sec = (host_count * avg_check_time_sec) / parallel_checks;  
+      
+    // 转换为分钟，向上取整  
+    int min_interval_min = (min_interval_sec + 59) / 60;  
+      
+    // 最小不低于 1 分钟  
+    return (min_interval_min < 1) ? 1 : min_interval_min;  
+}
+
 // 打印帮助信息
 static void print_help(const char *prog_name)
 {
@@ -5532,9 +5548,36 @@ int main(int argc, char *argv[])
         }
     }
 
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: 初始化全局状态，检测间隔时间 %d 分钟\n", timestamp(), check_interval);
+    // 根据主机数量验证间隔参数 
+    if (g_state.host_count > 0)  
+    {  
+    int min_check_interval = calculate_min_interval(g_state.host_count, g_max_parallel_checks);  
+    int min_refresh_interval = min_check_interval;  // 手动刷新至少与自动检测相同  
+      
+    // 验证 -i 参数  
+    if (check_interval < min_check_interval)  
+    {  
+        fprintf(stderr, "[%s] [WARN]: 自动检测间隔 %d 分钟过短（主机数: %d, 并行线程: %d）\n",  
+                timestamp(), check_interval, g_state.host_count, g_max_parallel_checks);  
+        fprintf(stderr, "[%s] [WARN]: 推荐最小间隔: %d 分钟（基于 %d 个主机 / %d 并行线程）\n",  
+                timestamp(), min_check_interval, g_state.host_count, g_max_parallel_checks);  
+        fprintf(stderr, "[%s] [WARN]: 已自动调整为推荐值: %d 分钟\n",  
+                timestamp(), min_check_interval);  
+        check_interval = min_check_interval;  
+        g_state.check_interval_minutes = check_interval;  
+    }  
+      
+    // 验证 -r 参数  
+    if (manual_refresh_interval < min_refresh_interval)  
+    {  
+        fprintf(stderr, "[%s] [WARN]: 手动检测间隔 %d 分钟过短（主机数: %d, 并行线程: %d）\n",  
+                timestamp(), manual_refresh_interval, g_state.host_count, g_max_parallel_checks);  
+        fprintf(stderr, "[%s] [WARN]: 推荐最小间隔: %d 分钟\n",  
+                timestamp(), min_refresh_interval);  
+        fprintf(stderr, "[%s] [WARN]: 已自动调整为推荐值: %d 分钟\n",  
+                timestamp(), min_refresh_interval);  
+        manual_refresh_interval = min_refresh_interval;  
+    }  
     }
 
     // 解析主机列表
