@@ -98,9 +98,33 @@ jobs:
         target: ${{ matrix.URL }}
         static: true
         gccpath: /tmp
+
+     - name: 缓存 zlib
+       id: cache-zlib
+       uses: actions/cache@v4
+       with:
+        path: |
+          /opt/zlib-${{ matrix.URL }}
+        key: zlib-${{ matrix.URL }}-cache
+     - name: 编译 zlib
+       env:
+         TARGET: ${{ matrix.target }}
+         URL: ${{ matrix.URL }}
+       run: |
+         if [ ! -d "/opt/zlib-${URL}" ] || [ -z "$(find /opt/zlib-${URL}/lib -name '*.a' 2>/dev/null)" ] ; then
+            wget https://www.zlib.net/zlib-1.3.1.tar.gz
+            tar xf zlib-1.3.1.tar.gz
+            cd zlib-1.3.1
+            echo "######################编译zlib依赖库########################"
+            ./configure --static --prefix=/opt/zlib-${URL}
+            make -j$(nproc)
+            make install
+         fi
          
      - name: 编译
        run: |
+         export CFLAGS="$CFLAGS -I/opt/zlib-${URL}/include"
+         export LDFLAGS="$LDFLAGS -L/opt/zlib-${URL}/lib"
          make 
          mkdir -p bin
          mv n2n_check_cli bin/n2n_check_cli
