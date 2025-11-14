@@ -19,6 +19,8 @@
 #include <signal.h>
 #include <ctype.h>
 #include <sys/wait.h>
+#include <unistd.h>
+#include <zlib.h>
 
 #define N2N_COMMUNITY_SIZE 20
 #define N2N_MAC_SIZE 6
@@ -35,17 +37,31 @@ static int g_syslog_pipe[2];                        // 管道文件描述符
 static pthread_t g_syslog_thread;                   // syslog 转发线程
 static int g_syslog_running = 0;                    // 线程运行标志
 time_t last_manual_refresh = 0;                     // 记录上次手动刷新时间
-int manual_refresh_interval = 1;                    // 默认1分钟检测间隔
+int manual_refresh_interval = 5;                    // 默认1分钟检测间隔
 static long g_timeout_ms = 1000;                    // 默认 1000ms (1秒)未响应判定为离线
 static int g_max_retries = 5;                       // 默认5次 检测重试次数
 static int g_max_history = 300;                     // 默认300条 保存的最大历史检测记录
 static char g_state_dir[1024] = "/tmp/n2n_monitor"; // 默认历史检测记录保存路径
 static char g_callback_script[1024] = "";           // 回调脚本路径
+static int g_max_parallel_checks = 5;               // 默认 5 个并行线程进行检测
 
 static int verbose = 0;
 static char g_community[N2N_COMMUNITY_SIZE] = "N2N_check_bot";
 static uint8_t g_mac[N2N_MAC_SIZE] = {0xa1, 0xb2, 0xc3, 0xd4, 0xf5, 0x06}; // a1:b2:c3:d4:f5:06
 static volatile sig_atomic_t g_shutdown_requested = 0;
+
+// 并行检测任务结构
+typedef struct
+{
+    char host[256]; // 要检测的主机
+    int port;       // 端口
+    int host_index; // 在 g_state.hosts 中的索引
+    int v1_ok;      // v1 检测结果
+    int v2_ok;      // v2 检测结果
+    int v2s_ok;     // v2s 检测结果
+    int v3_ok;      // v3 检测结果
+    int is_online;  // 是否在线
+} check_task_t;
 
 // 单次检测记录
 typedef struct
@@ -79,7 +95,7 @@ typedef struct
 {
     host_stats_t hosts[MAX_HOSTS];
     int host_count;
-    pthread_mutex_t lock;
+    pthread_rwlock_t lock;
     int check_interval_minutes;
     time_t start_time;
     int running;
@@ -1246,7 +1262,7 @@ static void reload_config(void)
         fprintf(stderr, "[%s] [DEBUG]: 检测到配置文件变化,开始重新加载\n", timestamp());
     }
 
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_wrlock(&g_state.lock);
     // 保存所有主机的历史记录
     for (int i = 0; i < g_state.host_count; i++)
     {
@@ -1265,7 +1281,7 @@ static void reload_config(void)
     g_state.host_count = 0;
     memset(g_state.hosts, 0, sizeof(g_state.hosts));
 
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_unlock(&g_state.lock);
 
     // 重新加载配置文件
     load_config(g_state.config_file_path);
@@ -2117,7 +2133,7 @@ void generate_html(char *buf, size_t bufsize)
     {
         fprintf(stderr, "[%s] [DEBUG]: 开始生成 HTML 页面\n", timestamp());
     }
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_rdlock(&g_state.lock);
 
     time_t now = time(NULL);
     time_t uptime = now - g_state.start_time;
@@ -2919,7 +2935,7 @@ void generate_html(char *buf, size_t bufsize)
             float overall_rate = calculate_uptime(h);
 
             // 转换最后检测时间
-            char last_check_str[128] = "从未检测";
+            char last_check_str[128] = "正在检测";
             if (h->last_check > 0)
             {
                 time_t elapsed = now - h->last_check;
@@ -3112,7 +3128,7 @@ void generate_html(char *buf, size_t bufsize)
         fprintf(stderr, "[%s] [DEBUG]: HTML 生成完成,总长度: %d 字节\n", timestamp(), len);
     }
 
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_unlock(&g_state.lock);
 }
 
 // 不区分大小写查找请求头
@@ -3214,6 +3230,106 @@ void send_chunked_response(int client_sock, const char *content, size_t content_
         fprintf(stderr, "[%s] [DEBUG]: 分块传输完成，共发送 %zu 字节\n",
                 timestamp(), offset);
     }
+}
+
+void send_compressed_response(int client_sock, const char *content, size_t content_len)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始压缩 %zu 字节数据\n",
+                timestamp(), content_len);
+    }
+
+    // 计算压缩后的最大大小
+    uLongf compressed_size = compressBound(content_len);
+    unsigned char *compressed = malloc(compressed_size);
+
+    if (!compressed)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [ERROR]: 压缩缓冲区分配失败，使用未压缩传输\n", timestamp());
+        }
+        send_chunked_response(client_sock, content, content_len);
+        return;
+    }
+
+    // 执行 gzip 压缩
+    int result = compress2(compressed, &compressed_size,
+                           (const unsigned char *)content, content_len,
+                           Z_DEFAULT_COMPRESSION);
+
+    if (result != Z_OK)
+    {
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [ERROR]: 压缩失败 (错误码: %d)，使用未压缩传输\n",
+                    timestamp(), result);
+        }
+        free(compressed);
+        send_chunked_response(client_sock, content, content_len);
+        return;
+    }
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 压缩完成: %zu -> %lu 字节 (压缩率: %.1f%%)\n",
+                timestamp(), content_len, compressed_size,
+                (compressed_size * 100.0) / content_len);
+    }
+
+    // 发送 HTTP 头（带 gzip 编码）
+    const char *header =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Encoding: deflate\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n";
+
+    send(client_sock, header, strlen(header), 0);
+
+    // 分块发送压缩数据
+    const size_t chunk_size = 16384;
+    size_t offset = 0;
+
+    while (offset < compressed_size)
+    {
+        size_t remaining = compressed_size - offset;
+        size_t current_chunk = (remaining > chunk_size) ? chunk_size : remaining;
+
+        // 发送块大小（十六进制格式）
+        char chunk_header[32];
+        int header_len = snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n", current_chunk);
+        send(client_sock, chunk_header, header_len, 0);
+
+        // 发送块数据
+        ssize_t sent = send(client_sock, compressed + offset, current_chunk, 0);
+        if (sent <= 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 压缩数据传输失败: %s\n",
+                        timestamp(), strerror(errno));
+            }
+            break;
+        }
+
+        // 发送块结束标记
+        send(client_sock, "\r\n", 2, 0);
+
+        offset += current_chunk;
+    }
+
+    // 发送结束块
+    send(client_sock, "0\r\n\r\n", 5, 0);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 压缩数据传输完成，共发送 %zu 字节\n",
+                timestamp(), offset);
+    }
+
+    free(compressed);
 }
 
 void generate_svg_response(int client_sock, int is_online, float uptime,
@@ -3619,7 +3735,7 @@ void handle_api_request(int client_sock, const char *path)
     int actual_port = 0;
     int found = 0;
 
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_wrlock(&g_state.lock);
     for (int i = 0; i < g_state.host_count; i++)
     {
         if (g_state.hosts[i].display_name[0] &&
@@ -3649,7 +3765,7 @@ void handle_api_request(int client_sock, const char *path)
             break;
         }
     }
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_unlock(&g_state.lock);
 
     // 如果未找到匹配的前端显示名称,按原格式解析 host:port
     if (!found)
@@ -3786,7 +3902,7 @@ void handle_api_request(int client_sock, const char *path)
 
     // 检查历史记录
     float uptime = -1.0f;
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_wrlock(&g_state.lock);
     for (int i = 0; i < g_state.host_count; i++)
     {
         if (strcmp(g_state.hosts[i].host, actual_host) == 0 &&
@@ -3800,7 +3916,7 @@ void handle_api_request(int client_sock, const char *path)
             break;
         }
     }
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_unlock(&g_state.lock);
 
     // 生成 SVG 响应
     generate_svg_response(client_sock, result == 0, uptime, v1_ok, v2_ok, v2s_ok, v3_ok);
@@ -3895,10 +4011,110 @@ static void call_status_change_script(host_stats_t *h, int is_online,
     }
 }
 
+// 并行检测工作线程
+void *check_host_worker(void *arg)
+{
+    check_task_t *task = (check_task_t *)arg;
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 工作线程开始检测 %s:%d\n",
+                timestamp(), task->host, task->port);
+    }
+
+    // 解析真实的 IP 和端口
+    char real_host[256];
+    int real_port;
+    int resolve_failed = 0;
+
+    if (strncmp(task->host, "txt:", 4) == 0)
+    {
+        // TXT 记录解析
+        if (resolve_txt_record(task->host, real_host, &real_port) == 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: TXT 解析: %s -> %s:%d\n",
+                        timestamp(), task->host, real_host, real_port);
+            }
+        }
+        else
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: TXT 解析失败: %s\n",
+                        timestamp(), task->host);
+            }
+            resolve_failed = 1;
+        }
+    }
+    else if (strncmp(task->host, "http:", 5) == 0)
+    {
+        // HTTP 重定向解析
+        if (resolve_http_redirect(task->host, task->port, real_host, &real_port) == 0)
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: HTTP 解析: %s -> %s:%d\n",
+                        timestamp(), task->host, real_host, real_port);
+            }
+        }
+        else
+        {
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: HTTP 解析失败: %s\n",
+                        timestamp(), task->host);
+            }
+            resolve_failed = 1;
+        }
+    }
+    else
+    {
+        // 普通主机，直接使用原始地址
+        strncpy(real_host, task->host, sizeof(real_host) - 1);
+        real_host[sizeof(real_host) - 1] = '\0';
+        real_port = task->port;
+    }
+
+    // 执行检测
+    if (!resolve_failed)
+    {
+        test_supernode_internal(real_host, real_port,
+                                &task->v1_ok, &task->v2_ok,
+                                &task->v2s_ok, &task->v3_ok);
+    }
+    else
+    {
+        // 解析失败，所有版本标记为失败
+        task->v1_ok = 0;
+        task->v2_ok = 0;
+        task->v2s_ok = 0;
+        task->v3_ok = 0;
+    }
+
+    // 判断是否在线
+    task->is_online = (task->v1_ok || task->v2_ok || task->v2s_ok || task->v3_ok);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 工作线程完成检测 %s:%d - %s (v1:%s v2:%s v2s:%s v3:%s)\n",
+                timestamp(), task->host, task->port,
+                task->is_online ? "在线" : "离线",
+                task->v1_ok ? "✓" : "✗",
+                task->v2_ok ? "✓" : "✗",
+                task->v2s_ok ? "✓" : "✗",
+                task->v3_ok ? "✓" : "✗");
+    }
+
+    return NULL;
+}
+
+// 处理手动刷新请求（使用并行检测）
 void handle_refresh_request(int client_sock)
 {
     time_t now = time(NULL);
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_rdlock(&g_state.lock);
 
     if (verbose)
     {
@@ -3906,9 +4122,10 @@ void handle_refresh_request(int client_sock)
                 timestamp(), now, last_manual_refresh, manual_refresh_interval * 60, now - last_manual_refresh);
     }
 
+    // 检查刷新间隔
     if (now - last_manual_refresh < manual_refresh_interval * 60)
     {
-        pthread_mutex_unlock(&g_state.lock);
+        pthread_rwlock_unlock(&g_state.lock);
 
         if (verbose)
         {
@@ -3927,12 +4144,14 @@ void handle_refresh_request(int client_sock)
     }
 
     last_manual_refresh = now;
-    pthread_mutex_unlock(&g_state.lock);
+    int total_hosts = g_state.host_count;
+    pthread_rwlock_unlock(&g_state.lock);
 
     if (verbose)
     {
-        fprintf(stderr, "[%s] [DEBUG]: 开始执行刷新,检测 %d 个主机\n", timestamp(), g_state.host_count);
+        fprintf(stderr, "[%s] [DEBUG]: 开始执行刷新,检测 %d 个主机\n", timestamp(), total_hosts);
     }
+
     // 检查配置文件是否被修改
     if (g_state.config_file_path[0] != '\0')
     {
@@ -3965,103 +4184,120 @@ void handle_refresh_request(int client_sock)
         }
     }
 
-    if (g_state.host_count > 0)
+    if (total_hosts > 0)
     {
-        // 执行检测逻辑
-        for (int i = 0; i < g_state.host_count; i++)
+        // ========== 并行检测逻辑 ==========
+        for (int i = 0; i < total_hosts; i += g_max_parallel_checks)
         {
-            host_stats_t *h = &g_state.hosts[i];
-            int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;
+            // 计算本批次要检测的主机数量
+            int batch_size = (i + g_max_parallel_checks > total_hosts)
+                                 ? (total_hosts - i)
+                                 : g_max_parallel_checks;
 
-            // 解析真实的 IP 和端口
-            char real_host[256];
-            int real_port;
-            int resolve_failed = 0;
-
-            if (strncmp(h->host, "txt:", 4) == 0)
+            if (verbose)
             {
-                // TXT 记录解析
-                if (resolve_txt_record(h->host, real_host, &real_port) == 0)
+                fprintf(stderr, "[%s] [DEBUG]: 手动刷新批次 %d/%d，检测 %d 个主机\n",
+                        timestamp(), i / g_max_parallel_checks + 1,
+                        (total_hosts + g_max_parallel_checks - 1) / g_max_parallel_checks,
+                        batch_size);
+            }
+
+            // 准备任务和线程数组
+            check_task_t tasks[g_max_parallel_checks];
+            pthread_t threads[g_max_parallel_checks];
+
+            // 启动一批检测线程
+            for (int j = 0; j < batch_size; j++)
+            {
+                int idx = i + j;
+
+                // 从全局状态复制主机信息
+                pthread_rwlock_rdlock(&g_state.lock);
+                memset(&tasks[j], 0, sizeof(check_task_t));
+                strncpy(tasks[j].host, g_state.hosts[idx].host, sizeof(tasks[j].host) - 1);
+                tasks[j].host[sizeof(tasks[j].host) - 1] = '\0';
+                tasks[j].port = g_state.hosts[idx].port;
+                pthread_rwlock_unlock(&g_state.lock);
+
+                tasks[j].host_index = idx;
+
+                // 创建线程
+                if (pthread_create(&threads[j], NULL, check_host_worker, &tasks[j]) != 0)
                 {
-                    if (verbose)
+                    fprintf(stderr, "[%s] [ERROR]: 无法创建检测线程 %d: %s\n",
+                            timestamp(), j, strerror(errno));
+                    // 如果线程创建失败，直接在主线程中执行
+                    check_host_worker(&tasks[j]);
+                }
+            }
+
+            // 等待所有线程完成
+            for (int j = 0; j < batch_size; j++)
+            {
+                pthread_join(threads[j], NULL);
+            }
+
+            if (verbose)
+            {
+                fprintf(stderr, "[%s] [DEBUG]: 批次完成，开始更新统计数据\n", timestamp());
+            }
+
+            // 批量更新统计数据（一次性加写锁）
+            pthread_rwlock_wrlock(&g_state.lock);
+
+            for (int j = 0; j < batch_size; j++)
+            {
+                int idx = tasks[j].host_index;
+                host_stats_t *h = &g_state.hosts[idx];
+
+                // 更新统计
+                h->total_checks++;
+                if (tasks[j].v1_ok)
+                    h->success_v1++;
+                if (tasks[j].v2_ok)
+                    h->success_v2++;
+                if (tasks[j].v2s_ok)
+                    h->success_v2s++;
+                if (tasks[j].v3_ok)
+                    h->success_v3++;
+                h->last_check = time(NULL);
+
+                // 检测状态变化
+                if (g_callback_script[0] != '\0' && h->last_online_status != tasks[j].is_online)
+                {
+                    // 避免首次检测时就是在线的情况触发
+                    if (h->last_online_status != -1 || !tasks[j].is_online)
                     {
-                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析: %s -> %s:%d\n",
-                                timestamp(), h->host, real_host, real_port);
+                        call_status_change_script(h, tasks[j].is_online,
+                                                  tasks[j].v1_ok, tasks[j].v2_ok,
+                                                  tasks[j].v2s_ok, tasks[j].v3_ok);
                     }
                 }
-                else
+                h->last_online_status = tasks[j].is_online;
+
+                // 添加检测记录到历史数组
+                add_check_record(h, tasks[j].is_online);
+
+                // 更新状态文本
+                snprintf(h->last_status, sizeof(h->last_status),
+                         tasks[j].is_online ? "✓ 在线" : "✗ 离线");
+
+                // 保存历史记录到文件
+                save_history(h);
+
+                if (verbose)
                 {
-                    // 解析失败，标记但继续正常流程
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析失败: %s\n", timestamp(), h->host);
-                    }
-                    resolve_failed = 1;
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测结果: %s (v1:%s v2:%s v2s:%s v3:%s)\n",
+                            timestamp(), h->host, h->port,
+                            tasks[j].is_online ? "在线" : "离线",
+                            tasks[j].v1_ok ? "✓" : "✗",
+                            tasks[j].v2_ok ? "✓" : "✗",
+                            tasks[j].v2s_ok ? "✓" : "✗",
+                            tasks[j].v3_ok ? "✓" : "✗");
                 }
             }
-            else if (strncmp(h->host, "http:", 5) == 0)
-            {
-                // HTTP 重定向解析
-                if (resolve_http_redirect(h->host, h->port, real_host, &real_port) == 0)
-                {
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析: %s -> %s:%d\n",
-                                timestamp(), h->host, real_host, real_port);
-                    }
-                }
-                else
-                {
-                    // 解析失败，标记但继续正常流程
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析失败: %s\n", timestamp(), h->host);
-                    }
-                    resolve_failed = 1;
-                }
-            }
-            else
-            {
-                // 普通主机，直接使用原始地址
-                strncpy(real_host, h->host, sizeof(real_host) - 1);
-                real_host[sizeof(real_host) - 1] = '\0';
-                real_port = h->port;
-            }
 
-            if (!resolve_failed)
-            {
-                test_supernode_internal(real_host, real_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
-            }
-
-            pthread_mutex_lock(&g_state.lock);
-            h->total_checks++;
-            if (v1_ok)
-                h->success_v1++;
-            if (v2_ok)
-                h->success_v2++;
-            if (v2s_ok)
-                h->success_v2s++;
-            if (v3_ok)
-                h->success_v3++;
-            h->last_check = time(NULL);
-
-            int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);
-
-            // 检测状态变化
-            if (g_callback_script[0] != '\0' && h->last_online_status != is_online)
-            {
-                // 避免首次检测时就是在线的情况触发
-                if (h->last_online_status != -1 || !is_online)
-                {
-                    call_status_change_script(h, is_online, v1_ok, v2_ok, v2s_ok, v3_ok);
-                }
-            }
-            h->last_online_status = is_online;
-            add_check_record(h, is_online);
-            snprintf(h->last_status, sizeof(h->last_status),
-                     is_online ? "✓ 在线" : "✗ 离线");
-            save_history(h); // 确保数据已保存
-            pthread_mutex_unlock(&g_state.lock);
+            pthread_rwlock_unlock(&g_state.lock);
         }
 
         if (verbose)
@@ -4076,6 +4312,7 @@ void handle_refresh_request(int client_sock)
             fprintf(stderr, "[%s] [DEBUG]: 没有配置主机,跳过本轮检测\n", timestamp());
         }
     }
+
     // 所有检测完成后才发送响应
     char response[512];
     int len = snprintf(response, sizeof(response),
@@ -4210,7 +4447,7 @@ void handle_testmy_request(int client_sock, const char *path)
 
     // 【检查是否是已配置的主机或隐私主机名】
     int is_mine = 0;
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_wrlock(&g_state.lock);
 
     // 去除用户输入的所有空格和换行符
     char cleaned_decoded[512] = {0};
@@ -4330,7 +4567,7 @@ void handle_testmy_request(int client_sock, const char *path)
     {
         fprintf(stderr, "[%s] [DEBUG]: 测测我的 - 检查结果: is_mine=%d\n", timestamp(), is_mine);
     }
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_unlock(&g_state.lock);
 
     if (is_mine)
     {
@@ -4499,7 +4736,7 @@ void handle_http_request(int client_sock)
         }
 
         // ========== 动态缓冲区分配 ==========
-        pthread_mutex_lock(&g_state.lock);
+        pthread_rwlock_wrlock(&g_state.lock);
 
         // 基础大小: HTTP 头 + HTML 框架
         size_t base_size = 50000;
@@ -4518,7 +4755,7 @@ void handle_http_request(int client_sock)
             buffer_size = 10485760; // 最大 10MB
 
         int host_count = g_state.host_count;
-        pthread_mutex_unlock(&g_state.lock);
+        pthread_rwlock_unlock(&g_state.lock);
 
         char *response = malloc(buffer_size);
         if (response)
@@ -4531,9 +4768,28 @@ void handle_http_request(int client_sock)
 
             generate_html(response, buffer_size);
 
-            // ========== 使用分块传输 ==========
+            // ========== 检测客户端是否支持 gzip ==========
+            char *accept_encoding = find_header_value(request, "Accept-Encoding");
+            int supports_gzip = (accept_encoding && strstr(accept_encoding, "gzip"));
+
             size_t response_len = strlen(response);
-            send_chunked_response(client_sock, response, response_len);
+
+            if (supports_gzip)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 客户端支持 gzip，使用压缩传输\n", timestamp());
+                }
+                send_compressed_response(client_sock, response, response_len);
+            }
+            else
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 客户端不支持 gzip，使用未压缩传输\n", timestamp());
+                }
+                send_chunked_response(client_sock, response, response_len);
+            }
 
             if (verbose)
             {
@@ -4571,15 +4827,16 @@ void handle_http_request(int client_sock)
         fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());
     }
 }
-
 // 监控线程
 void *monitor_thread(void *arg)
 {
     (void)arg;
     if (verbose)
     {
-        fprintf(stderr, "[%s] [DEBUG]: 监控线程启动\n", timestamp());
+        fprintf(stderr, "[%s] [DEBUG]: 监控线程启动（并行检测模式，最多 %d 个并发）\n",
+                timestamp(), g_max_parallel_checks);
     }
+
     int round = 0;
     while (g_state.running)
     {
@@ -4622,161 +4879,134 @@ void *monitor_thread(void *arg)
             fprintf(stderr, "[%s] [DEBUG]: 开始第 %d 轮检测 (共 %d 个主机)\n",
                     timestamp(), round, g_state.host_count);
         }
-        for (int i = 0; i < g_state.host_count; i++)
+
+        // ========== 并行检测逻辑 ==========
+        int total_hosts = g_state.host_count;
+
+        for (int i = 0; i < total_hosts; i += g_max_parallel_checks)
         {
-            host_stats_t *h = &g_state.hosts[i];
-            if (verbose)
-            {
-                fprintf(stderr, "[%s] [DEBUG]: 检测主机 %d/%d: %s:%d\n",
-                        timestamp(), i + 1, g_state.host_count, h->host, h->port);
-            }
-
-            // 解析真实的 IP 和端口
-            char real_host[256];
-            int real_port;
-            int resolve_failed = 0;
-
-            if (strncmp(h->host, "txt:", 4) == 0)
-            {
-                // TXT 记录解析
-                if (resolve_txt_record(h->host, real_host, &real_port) == 0)
-                {
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析: %s -> %s:%d\n",
-                                timestamp(), h->host, real_host, real_port);
-                    }
-                }
-                else
-                {
-                    // 解析失败，标记但继续正常流程
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: TXT 解析失败: %s\n", timestamp(), h->host);
-                    }
-                    resolve_failed = 1;
-                }
-            }
-            else if (strncmp(h->host, "http:", 5) == 0)
-            {
-                // HTTP 重定向解析
-                if (resolve_http_redirect(h->host, h->port, real_host, &real_port) == 0)
-                {
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析: %s -> %s:%d\n",
-                                timestamp(), h->host, real_host, real_port);
-                    }
-                }
-                else
-                {
-                    // 解析失败，标记但继续正常流程
-                    if (verbose)
-                    {
-                        fprintf(stderr, "[%s] [DEBUG]: HTTP 解析失败: %s\n", timestamp(), h->host);
-                    }
-                    resolve_failed = 1;
-                }
-            }
-            else
-            {
-                // 普通主机，直接使用原始地址
-                strncpy(real_host, h->host, sizeof(real_host) - 1);
-                real_host[sizeof(real_host) - 1] = '\0';
-                real_port = h->port;
-            }
-
-            int v1_ok = 0, v2_ok = 0, v2s_ok = 0, v3_ok = 0;
-            int result = -1;
-            if (!resolve_failed)
-            {
-                result = test_supernode_internal(real_host, real_port, &v1_ok, &v2_ok, &v2s_ok, &v3_ok);
-            }
-
-            pthread_mutex_lock(&g_state.lock);
-            h->total_checks++;
-
-            if (v1_ok)
-                h->success_v1++;
-            if (v2_ok)
-                h->success_v2++;
-            if (v2s_ok)
-                h->success_v2s++;
-            if (v3_ok)
-                h->success_v3++;
-            h->last_check = time(NULL);
-
-            // 【新增】判断本次检测是否在线(任一版本成功即为在线)
-            int is_online = (v1_ok || v2_ok || v2s_ok || v3_ok);
-
-            // 检测状态变化
-            if (g_callback_script[0] != '\0' && h->last_online_status != is_online)
-            {
-                // 避免首次检测时就是在线的情况触发
-                if (h->last_online_status != -1 || !is_online)
-                {
-                    call_status_change_script(h, is_online, v1_ok, v2_ok, v2s_ok, v3_ok);
-                }
-            }
-            h->last_online_status = is_online;
-
-            // 【新增】添加检测记录到历史数组
-            add_check_record(h, is_online);
+            // 计算本批次要检测的主机数量
+            int batch_size = (i + g_max_parallel_checks > total_hosts)
+                                 ? (total_hosts - i)
+                                 : g_max_parallel_checks;
 
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 添加历史记录: %s (history_count=%d, history_index=%d)\n",
-                        timestamp(), h->host, h->port,
-                        is_online ? "在线" : "离线",
-                        h->history_count, h->history_index);
+                fprintf(stderr, "[%s] [DEBUG]: 开始批次 %d/%d，检测 %d 个主机\n",
+                        timestamp(), i / g_max_parallel_checks + 1,
+                        (total_hosts + g_max_parallel_checks - 1) / g_max_parallel_checks,
+                        batch_size);
             }
 
-            if (is_online)
+            // 准备任务和线程数组
+            check_task_t tasks[g_max_parallel_checks];
+            pthread_t threads[g_max_parallel_checks];
+
+            // 启动一批检测线程
+            for (int j = 0; j < batch_size; j++)
             {
-                snprintf(h->last_status, sizeof(h->last_status), "✓ 在线");
-            }
-            else
-            {
-                snprintf(h->last_status, sizeof(h->last_status), "✗ 离线");
+                int idx = i + j;
+                host_stats_t *h = &g_state.hosts[idx];
+
+                // 初始化任务
+                memset(&tasks[j], 0, sizeof(check_task_t));
+                strncpy(tasks[j].host, h->host, sizeof(tasks[j].host) - 1);
+                tasks[j].host[sizeof(tasks[j].host) - 1] = '\0';
+                tasks[j].port = h->port;
+                tasks[j].host_index = idx;
+
+                // 创建线程
+                if (pthread_create(&threads[j], NULL, check_host_worker, &tasks[j]) != 0)
+                {
+                    fprintf(stderr, "[%s] [ERROR]: 无法创建检测线程 %d: %s\n",
+                            timestamp(), j, strerror(errno));
+                    // 如果线程创建失败，直接在主线程中执行
+                    check_host_worker(&tasks[j]);
+                }
             }
 
-            // 【新增】保存历史记录到文件
-            save_history(h);
+            // 等待所有线程完成
+            for (int j = 0; j < batch_size; j++)
+            {
+                pthread_join(threads[j], NULL);
+            }
 
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 历史记录已保存到 %s/%s_%d.dat\n",
-                        timestamp(), h->host, h->port, g_state_dir, h->host, h->port);
+                fprintf(stderr, "[%s] [DEBUG]: 批次完成，开始更新统计数据\n", timestamp());
             }
 
-            pthread_mutex_unlock(&g_state.lock);
+            // 批量更新统计数据（一次性加写锁）
+            pthread_rwlock_wrlock(&g_state.lock);
 
-            if (verbose)
+            for (int j = 0; j < batch_size; j++)
             {
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测结果: %s (v1:%s v2:%s v2s:%s v3:%s)\n",
-                        timestamp(), h->host, h->port,
-                        result == 0 ? "成功" : "失败",
-                        v1_ok ? "✓" : "✗",
-                        v2_ok ? "✓" : "✗",
-                        v2s_ok ? "✓" : "✗",
-                        v3_ok ? "✓" : "✗");
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 累计统计: 总检测=%d, v1=%d, v2=%d, v2s=%d, v3=%d\n",
-                        timestamp(), h->host, h->port,
-                        h->total_checks, h->success_v1, h->success_v2, h->success_v2s, h->success_v3);
+                int idx = tasks[j].host_index;
+                host_stats_t *h = &g_state.hosts[idx];
 
-                // 【新增】输出连通率信息
-                float uptime = calculate_uptime(h);
-                fprintf(stderr, "[%s] [DEBUG]: %s:%d 连通率: %.2f%% (基于最近 %d 次检测)\n",
-                        timestamp(), h->host, h->port, uptime, h->history_count);
+                // 更新统计
+                h->total_checks++;
+                if (tasks[j].v1_ok)
+                    h->success_v1++;
+                if (tasks[j].v2_ok)
+                    h->success_v2++;
+                if (tasks[j].v2s_ok)
+                    h->success_v2s++;
+                if (tasks[j].v3_ok)
+                    h->success_v3++;
+                h->last_check = time(NULL);
+
+                // 检测状态变化
+                if (g_callback_script[0] != '\0' && h->last_online_status != tasks[j].is_online)
+                {
+                    // 避免首次检测时就是在线的情况触发
+                    if (h->last_online_status != -1 || !tasks[j].is_online)
+                    {
+                        call_status_change_script(h, tasks[j].is_online,
+                                                  tasks[j].v1_ok, tasks[j].v2_ok,
+                                                  tasks[j].v2s_ok, tasks[j].v3_ok);
+                    }
+                }
+                h->last_online_status = tasks[j].is_online;
+
+                // 添加检测记录到历史数组
+                add_check_record(h, tasks[j].is_online);
+
+                // 更新状态文本
+                snprintf(h->last_status, sizeof(h->last_status),
+                         tasks[j].is_online ? "✓ 在线" : "✗ 离线");
+
+                // 保存历史记录到文件
+                save_history(h);
+
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 检测结果: %s (v1:%s v2:%s v2s:%s v3:%s)\n",
+                            timestamp(), h->host, h->port,
+                            tasks[j].is_online ? "在线" : "离线",
+                            tasks[j].v1_ok ? "✓" : "✗",
+                            tasks[j].v2_ok ? "✓" : "✗",
+                            tasks[j].v2s_ok ? "✓" : "✗",
+                            tasks[j].v3_ok ? "✓" : "✗");
+
+                    float uptime = calculate_uptime(h);
+                    fprintf(stderr, "[%s] [DEBUG]: %s:%d 连通率: %.2f%% (基于最近 %d 次检测)\n",
+                            timestamp(), h->host, h->port, uptime, h->history_count);
+                }
             }
+
+            pthread_rwlock_unlock(&g_state.lock);
         }
+
         if (verbose)
         {
             fprintf(stderr, "[%s] [DEBUG]: 第 %d 轮检测完成,等待 %d 分钟后开始下一轮\n",
                     timestamp(), round, g_state.check_interval_minutes);
         }
+
         sleep(g_state.check_interval_minutes * 60);
     }
+
     if (verbose)
     {
         fprintf(stderr, "[%s] [DEBUG]: 监控线程退出\n", timestamp());
@@ -4838,7 +5068,7 @@ void signal_handler(int signum)
     g_state.running = 0;
 
     // 保存所有主机的历史记录
-    pthread_mutex_lock(&g_state.lock);
+    pthread_rwlock_wrlock(&g_state.lock);
     for (int i = 0; i < g_state.host_count; i++)
     {
         save_history(&g_state.hosts[i]);
@@ -4848,7 +5078,7 @@ void signal_handler(int signum)
                     timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);
         }
     }
-    pthread_mutex_unlock(&g_state.lock);
+    pthread_rwlock_destroy(&g_state.lock);
 
     if (verbose)
     {
@@ -4864,10 +5094,11 @@ static void print_help(const char *prog_name)
     printf("用法: %s [选项] <主机1:端口1> [主机2:端口2] ...\n\n", prog_name);
     printf("选项:\n");
     printf("  -p <端口>       服务主页监听端口 (默认: 8585)\n");
-    printf("  -i <分钟>       自动探测间隔时间 (默认: 1)\n");
-    printf("  -r <分钟>       允许主页里手动探测的最小间隔时间 (默认: 1)\n");
+    printf("  -i <分钟>       自动探测间隔时间 (默认: 5)\n");
+    printf("  -r <分钟>       允许主页里手动探测的最小间隔时间 (默认: 5)\n");
     printf("  -t <秒>         探测超时时间 (默认: 1)\n");
     printf("  -z <次数>       探测超时或失败后最大重试次数 (默认: 5)\n");
+    printf("  -x <数量>       并行检测的最大线程数 (默认: 5, 范围: 1-20)\n");
     printf("  -j <数量>       保存历史检测记录条数 (默认: 300条/主机)\n");
     printf("  -d <路径>       历史检测记录保存目录 (默认: /tmp/n2n_monitor)\n");
     printf("  -f <文件>       从指定文件读取主机列表 (一行一个，支持备注)\n");
@@ -4886,9 +5117,9 @@ static void print_help(const char *prog_name)
     printf("  例如: script_file.sh n2n.example.com:10086 v1 up\n");
     printf("  例如: script_file.sh n2n.example.com:10082 Unknown down\n\n");
     printf("命令示例:\n");
-    printf("  %s -p 8080 -i 2 n2n.example.com:10086 192.168.1.1:10090\n", prog_name);
+    printf("  %s -p 8080 -i 10 n2n.example.com:10086 192.168.1.1:10090\n", prog_name);
     printf("  %s -v -6 \"supernode.example.com:7777|北京电信\" \"192.168.1.1:10090|自建\"\n", prog_name);
-    printf("  %s -p 8080 -i 2 -f n2n_host.conf\n", prog_name);
+    printf("  %s -p 8080 -i 10 -f n2n_host.conf\n", prog_name);
     printf("\n");
 }
 
@@ -4899,7 +5130,7 @@ int main(int argc, char *argv[])
     srand(time(NULL));
 
     int http_port = 8585;
-    int check_interval = 1;
+    int check_interval = 5;
     char *config_file = NULL;
     int arg_start = 1;
     int use_ipv6 = 0; // 默认仅 IPv4
@@ -5032,6 +5263,55 @@ int main(int argc, char *argv[])
                 fprintf(stderr, "[%s] [DEBUG]: 历史检测记录保存路径: %s\n",
                         timestamp(), g_state_dir);
             }
+        }
+        else if (strcmp(argv[arg_start], "-x") == 0 && arg_start + 1 < argc)
+        {
+            int user_specified = atoi(argv[arg_start + 1]);
+
+            // 检测 CPU 核心数
+            int cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
+            if (cpu_cores <= 0)
+            {
+                cpu_cores = 1;
+            }
+
+            // 计算推荐的最大线程数
+            int recommended_max = (cpu_cores <= 2) ? 3 : (cpu_cores <= 4) ? cpu_cores
+                                                     : (cpu_cores < 10)   ? cpu_cores
+                                                                          : 10;
+
+            // 验证用户输入
+            if (user_specified <= 0)
+            {
+                fprintf(stderr, "[%s] [ERROR]: 无效的并行检测线程数 %d (必须大于 0)\n",
+                        timestamp(), user_specified);
+                return 1;
+            }
+
+            // 如果超出推荐范围，给出警告并调整
+            if (user_specified > recommended_max)
+            {
+                fprintf(stderr, "[%s] [WARN]: 您指定的并行线程数 %d 超出推荐值 (设备CPU 核心数: %d, 推荐最大: %d)\n",
+                        timestamp(), user_specified, cpu_cores, recommended_max);
+                fprintf(stderr, "[%s] [WARN]: 已自动调整为推荐值: %d\n",
+                        timestamp(), recommended_max);
+                g_max_parallel_checks = recommended_max;
+            }
+            else if (user_specified > 20)
+            {
+                fprintf(stderr, "[%s] [WARN]: 您指定的并行线程数 %d 超出系统限制 (最大: 20)\n",
+                        timestamp(), user_specified);
+                fprintf(stderr, "[%s] [WARN]: 已自动调整为系统最大值: 20\n", timestamp());
+                g_max_parallel_checks = 20;
+            }
+            else
+            {
+                g_max_parallel_checks = user_specified;
+                fprintf(stderr, "[%s] [INFO]: 并行检测线程数: %d\n",
+                        timestamp(), g_max_parallel_checks);
+            }
+
+            arg_start += 2;
         }
         else if (strcmp(argv[arg_start], "-f") == 0 && arg_start + 1 < argc)
         {
@@ -5175,10 +5455,39 @@ int main(int argc, char *argv[])
     }
 
     // 初始化状态
-    pthread_mutex_init(&g_state.lock, NULL);
+    pthread_rwlock_init(&g_state.lock, NULL);
     g_state.check_interval_minutes = check_interval;
     g_state.start_time = time(NULL);
     g_state.running = 1;
+    // 自动检测 CPU 核心数
+    int cpu_cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cpu_cores <= 0)
+    {
+        cpu_cores = 1; // 检测失败时默认为 1
+        if (verbose)
+        {
+            fprintf(stderr, "[%s] [WARN]: 无法检测 CPU 核心数，默认为 1\n", timestamp());
+        }
+    }
+
+    // 如果用户没有通过 -n 参数指定，则自动设置
+    if (g_max_parallel_checks == 5)
+    { // 5 是默认值，说明用户没有指定
+        if (cpu_cores <= 2)
+        {
+            g_max_parallel_checks = 3; // 单核双线程用 3
+        }
+        else if (cpu_cores <= 4)
+        {
+            g_max_parallel_checks = cpu_cores; // 2-4 核用实际核心数
+        }
+        else
+        {
+            g_max_parallel_checks = (cpu_cores < 10) ? cpu_cores : 10; // 最多 10 个
+        }
+        fprintf(stderr, "[%s] [INFO]: 自动检测到 %d 个 CPU 核心，设置并行检测线程数为 %d\n",
+                timestamp(), cpu_cores, g_max_parallel_checks);
+    }
 
     // 注册信号处理函数
     signal(SIGTERM, signal_handler); // kill 命令
