@@ -123,8 +123,8 @@ jobs:
          
      - name: 编译
        run: |
-         export CFLAGS="$CFLAGS -I/opt/zlib-${URL}/include"
-         export LDFLAGS="$LDFLAGS -L/opt/zlib-${URL}/lib"
+         export CFLAGS="$CFLAGS -I/opt/zlib-${{ matrix.URL }}/include"
+         export LDFLAGS="$LDFLAGS -L/opt/zlib-${{ matrix.URL }}/lib"
          make 
          mkdir -p bin
          mv n2n_check_cli bin/n2n_check_cli
