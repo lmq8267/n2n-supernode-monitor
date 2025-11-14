@@ -44,6 +44,9 @@ static int g_max_history = 300;                     // 默认300条 保存的最
 static char g_state_dir[1024] = "/tmp/n2n_monitor"; // 默认历史检测记录保存路径
 static char g_callback_script[1024] = "";           // 回调脚本路径
 static int g_max_parallel_checks = 5;               // 默认 5 个并行线程进行检测
+static char *g_html_cache = NULL;                   // HTML 缓存
+static size_t g_html_cache_size = 0;                // 缓存大小
+static pthread_rwlock_t g_cache_lock;               // 缓存读写锁
 
 static int verbose = 0;
 static char g_community[N2N_COMMUNITY_SIZE] = "N2N_check_bot";
@@ -3145,6 +3148,62 @@ void generate_html(char *buf, size_t bufsize)
     pthread_rwlock_unlock(&g_state.lock);
 }
 
+void update_html_cache(void)
+{
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: 开始更新 HTML 缓存\n", timestamp());
+    }
+
+    // 计算所需缓冲区大小
+    pthread_rwlock_rdlock(&g_state.lock);
+    size_t base_size = 50000;
+    size_t per_host_size = 500 + (g_max_history * 50);
+    size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;
+
+    if (buffer_size < 262144)
+        buffer_size = 262144;
+    if (buffer_size > 10485760)
+        buffer_size = 10485760;
+
+    int host_count = g_state.host_count;
+    pthread_rwlock_unlock(&g_state.lock);
+
+    // 分配临时缓冲区
+    char *temp_buffer = malloc(buffer_size);
+    if (!temp_buffer)
+    {
+        fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓存缓冲区\n",
+                timestamp(), buffer_size);
+        return;
+    }
+
+    // 生成 HTML
+    generate_html(temp_buffer, buffer_size);
+    size_t html_len = strlen(temp_buffer);
+
+    // 更新全局缓存
+    pthread_rwlock_wrlock(&g_cache_lock);
+
+    // 释放旧缓存
+    if (g_html_cache)
+    {
+        free(g_html_cache);
+    }
+
+    // 设置新缓存
+    g_html_cache = temp_buffer;
+    g_html_cache_size = html_len;
+
+    pthread_rwlock_unlock(&g_cache_lock);
+
+    if (verbose)
+    {
+        fprintf(stderr, "[%s] [DEBUG]: HTML 缓存已更新 (%zu 字节, %d 个主机)\n",
+                timestamp(), html_len, host_count);
+    }
+}
+
 // 不区分大小写查找请求头
 static char *find_header_value(const char *request, const char *header_name)
 {
@@ -4312,6 +4371,8 @@ void handle_refresh_request(int client_sock)
             }
 
             pthread_rwlock_unlock(&g_state.lock);
+            // 更新 HTML 缓存
+            update_html_cache();
         }
 
         if (verbose)
@@ -4738,7 +4799,7 @@ void handle_http_request(int client_sock)
 
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 识别为主页请求，生成 HTML 响应\n", timestamp());
+                fprintf(stderr, "[%s] [DEBUG]: 识别为主页请求，使用缓存响应\n", timestamp());
             }
         }
         else
@@ -4749,44 +4810,20 @@ void handle_http_request(int client_sock)
             }
         }
 
-        // ========== 动态缓冲区分配 ==========
-        pthread_rwlock_wrlock(&g_state.lock);
+        // ========== 使用缓存的 HTML ==========
+        pthread_rwlock_rdlock(&g_cache_lock);
 
-        // 基础大小: HTTP 头 + HTML 框架
-        size_t base_size = 50000;
-
-        // 每个主机预估大小: 表格行 + 历史记录数据
-        // 表格行约 500 字节 + 历史记录 (每条约 50 字节)
-        size_t per_host_size = 500 + (g_max_history * 50);
-
-        // 总大小 = 基础 + (主机数 × 每主机大小) + 安全余量
-        size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;
-
-        // 设置最小值和最大值
-        if (buffer_size < 262144)
-            buffer_size = 262144; // 最小 256KB
-        if (buffer_size > 10485760)
-            buffer_size = 10485760; // 最大 10MB
-
-        int host_count = g_state.host_count;
-        pthread_rwlock_unlock(&g_state.lock);
-
-        char *response = malloc(buffer_size);
-        if (response)
+        if (g_html_cache && g_html_cache_size > 0)
         {
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 分配 %zu 字节缓冲区 (主机数: %d, 历史记录: %d)\n",
-                        timestamp(), buffer_size, host_count, g_max_history);
+                fprintf(stderr, "[%s] [DEBUG]: 使用缓存的 HTML (%zu 字节)\n",
+                        timestamp(), g_html_cache_size);
             }
 
-            generate_html(response, buffer_size);
-
-            // ========== 检测客户端是否支持 gzip ==========
+            // 检测客户端是否支持 gzip
             char *accept_encoding = find_header_value(request, "Accept-Encoding");
             int supports_gzip = (accept_encoding && strstr(accept_encoding, "gzip"));
-
-            size_t response_len = strlen(response);
 
             if (supports_gzip)
             {
@@ -4794,7 +4831,7 @@ void handle_http_request(int client_sock)
                 {
                     fprintf(stderr, "[%s] [DEBUG]: 客户端支持 gzip，使用压缩传输\n", timestamp());
                 }
-                send_compressed_response(client_sock, response, response_len);
+                send_compressed_response(client_sock, g_html_cache, g_html_cache_size);
             }
             else
             {
@@ -4802,21 +4839,86 @@ void handle_http_request(int client_sock)
                 {
                     fprintf(stderr, "[%s] [DEBUG]: 客户端不支持 gzip，使用未压缩传输\n", timestamp());
                 }
-                send_chunked_response(client_sock, response, response_len);
+                send_chunked_response(client_sock, g_html_cache, g_html_cache_size);
             }
+
+            pthread_rwlock_unlock(&g_cache_lock);
 
             if (verbose)
             {
-                fprintf(stderr, "[%s] [DEBUG]: 响应发送完成: %zu 字节\n", timestamp(), response_len);
+                fprintf(stderr, "[%s] [DEBUG]: 响应发送完成: %zu 字节\n",
+                        timestamp(), g_html_cache_size);
             }
-
-            free(response);
         }
         else
         {
+            pthread_rwlock_unlock(&g_cache_lock);
+
+            // 缓存未初始化,回退到实时生成
             if (verbose)
             {
-                fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓冲区\n", timestamp(), buffer_size);
+                fprintf(stderr, "[%s] [WARN]: HTML 缓存未初始化,使用实时生成\n", timestamp());
+            }
+
+            // 动态生成代码作为后备
+            pthread_rwlock_rdlock(&g_state.lock);
+            size_t base_size = 50000;
+            size_t per_host_size = 500 + (g_max_history * 50);
+            size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;
+
+            if (buffer_size < 262144)
+                buffer_size = 262144;
+            if (buffer_size > 10485760)
+                buffer_size = 10485760;
+
+            int host_count = g_state.host_count;
+            pthread_rwlock_unlock(&g_state.lock);
+
+            char *response = malloc(buffer_size);
+            if (response)
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 分配 %zu 字节缓冲区 (主机数: %d, 历史记录: %d)\n",
+                            timestamp(), buffer_size, host_count, g_max_history);
+                }
+
+                generate_html(response, buffer_size);
+                size_t response_len = strlen(response);
+
+                char *accept_encoding = find_header_value(request, "Accept-Encoding");
+                int supports_gzip = (accept_encoding && strstr(accept_encoding, "gzip"));
+
+                if (supports_gzip)
+                {
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: 客户端支持 gzip，使用压缩传输\n", timestamp());
+                    }
+                    send_compressed_response(client_sock, response, response_len);
+                }
+                else
+                {
+                    if (verbose)
+                    {
+                        fprintf(stderr, "[%s] [DEBUG]: 客户端不支持 gzip，使用未压缩传输\n", timestamp());
+                    }
+                    send_chunked_response(client_sock, response, response_len);
+                }
+
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [DEBUG]: 响应发送完成: %zu 字节\n", timestamp(), response_len);
+                }
+
+                free(response);
+            }
+            else
+            {
+                if (verbose)
+                {
+                    fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓冲区\n", timestamp(), buffer_size);
+                }
             }
         }
     }
@@ -4841,6 +4943,7 @@ void handle_http_request(int client_sock)
         fprintf(stderr, "[%s] [DEBUG]: HTTP 请求处理完成,连接已关闭\n", timestamp());
     }
 }
+
 // 监控线程
 void *monitor_thread(void *arg)
 {
@@ -5010,6 +5113,8 @@ void *monitor_thread(void *arg)
             }
 
             pthread_rwlock_unlock(&g_state.lock);
+            // 更新 HTML 缓存
+            update_html_cache();
         }
 
         if (verbose)
@@ -5092,7 +5197,17 @@ void signal_handler(int signum)
                     timestamp(), g_state.hosts[i].host, g_state.hosts[i].port);
         }
     }
+    pthread_rwlock_unlock(&g_state.lock);
     pthread_rwlock_destroy(&g_state.lock);
+    // 清理 HTML 缓存
+    pthread_rwlock_wrlock(&g_cache_lock);
+    if (g_html_cache)
+    {
+        free(g_html_cache);
+        g_html_cache = NULL;
+    }
+    pthread_rwlock_unlock(&g_cache_lock);
+    pthread_rwlock_destroy(&g_cache_lock);
 
     if (verbose)
     {
@@ -5486,6 +5601,7 @@ int main(int argc, char *argv[])
 
     // 初始化状态
     pthread_rwlock_init(&g_state.lock, NULL);
+    pthread_rwlock_init(&g_cache_lock, NULL);
     g_state.check_interval_minutes = check_interval;
     g_state.start_time = time(NULL);
     g_state.running = 1;
