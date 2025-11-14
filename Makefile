@@ -13,7 +13,7 @@ endif
   
 # 依赖库  
 LIBS_CLI = -lm  
-LIBS_HTTP = -lm -lpthread  
+LIBS_HTTP = -lm -lpthread -lz 
   
 # 目标文件  
 TARGETS = n2n_check_cli n2n_check_http  
