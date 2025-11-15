@@ -5996,7 +5996,7 @@ int main(int argc, char *argv[])
             arg_start += 2;
             // if (verbose)
             // {
-            fprintf(stderr, "[%s] [DEBUG]: 主页手动检测最小间隔时间: %d秒\n",
+            fprintf(stderr, "[%s] [DEBUG]: 主页手动检测最小间隔时间: %d分钟\n",
                     timestamp(), manual_refresh_interval);
             // }
         }
