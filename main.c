@@ -22,6 +22,21 @@
 #include <unistd.h>
 #include <zlib.h>
 
+// 确保 time_t 是 64 位(避免 2038 问题)  
+#if !defined(_TIME_BITS) && !defined(__LP64__)  
+    #define _TIME_BITS 64  
+    #define _FILE_OFFSET_BITS 64  
+#endif  
+  
+// 跨平台 time_t 格式化宏  
+#ifdef __LP64__  
+    #define TIME_FMT "%ld"  
+    #define TIME_CAST(x) ((long)(x))  
+#else  
+    #define TIME_FMT "%lld"  
+    #define TIME_CAST(x) ((long long)(x))  
+#endif
+
 #define N2N_COMMUNITY_SIZE 20
 #define N2N_MAC_SIZE 6
 #define N2N_COOKIE_SIZE 4
@@ -3367,15 +3382,15 @@ void generate_html(char *buf, size_t bufsize)
                 }
                 else if (elapsed < 60)
                 {
-                    snprintf(last_check_str, sizeof(last_check_str), "%ld秒前", elapsed);
+                    snprintf(last_check_str, sizeof(last_check_str), TIME_FMT "秒前", TIME_CAST(elapsed));
                 }
                 else if (elapsed < 3600)
                 {
-                    snprintf(last_check_str, sizeof(last_check_str), "%ld分钟前", elapsed / 60);
+                    snprintf(last_check_str, sizeof(last_check_str), TIME_FMT "分钟前", TIME_CAST(elapsed / 60));
                 }
                 else if (elapsed < 86400)
                 {
-                    snprintf(last_check_str, sizeof(last_check_str), "%ld小时前", elapsed / 3600);
+                    snprintf(last_check_str, sizeof(last_check_str), TIME_FMT "小时前", TIME_CAST(elapsed / 3600));
                 }
                 else
                 {
@@ -3417,10 +3432,10 @@ void generate_html(char *buf, size_t bufsize)
                     {
                         int idx = (start_idx + j) % h->max_history;
                         char record[64];
-                        snprintf(record, sizeof(record), "%ld:%d%s",
-                                 h->history[idx].timestamp,
-                                 h->history[idx].success,
-                                 (j < h->history_count - 1) ? "," : "");
+                        snprintf(record, sizeof(record), TIME_FMT ":%d%s",  
+                             TIME_CAST(h->history[idx].timestamp),  
+                             h->history[idx].success,  
+                             (j < h->history_count - 1) ? "," : "");
 
                         // 边界检查,防止 strcat 溢出
                         size_t current_len = strlen(history_data);
