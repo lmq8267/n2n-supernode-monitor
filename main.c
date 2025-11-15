@@ -2193,7 +2193,7 @@ void generate_html(char *buf, size_t bufsize)
     if (months > 0)
     {
         snprintf(uptime_str + strlen(uptime_str), sizeof(uptime_str) - strlen(uptime_str),
-                 "%s%d月", has_content ? " " : "", months);
+                 "%s%d个月", has_content ? " " : "", months);
         has_content = 1;
     }
     if (interval_months > 0)
@@ -2223,7 +2223,7 @@ void generate_html(char *buf, size_t bufsize)
     if (hours > 0)
     {
         snprintf(uptime_str + strlen(uptime_str), sizeof(uptime_str) - strlen(uptime_str),
-                 "%s%d时", has_content ? " " : "", hours);
+                 "%s%d小时", has_content ? " " : "", hours);
         has_content = 1;
     }
     if (interval_hours > 0)
@@ -3171,32 +3171,42 @@ void generate_html(char *buf, size_t bufsize)
             // 构建版本徽章
             char version_badges[256] = "";
             int has_any_version = 0;
+            int badge_offset = 0; 
 
             if (h->success_v1 > 0)
-            {
-                strcat(version_badges, "<span class='version-badge badge-v1'>v1</span>");
-                has_any_version = 1;
+            {  
+                badge_offset += snprintf(version_badges + badge_offset,   
+                            sizeof(version_badges) - badge_offset,  
+                            "<span class='version-badge badge-v1'>v1</span>");  
+                has_any_version = 1;  
             }
-            if (h->success_v2 > 0)
-            {
-                strcat(version_badges, "<span class='version-badge badge-v2'>v2</span>");
-                has_any_version = 1;
+            if (h->success_v2 > 0)  
+            {  
+                badge_offset += snprintf(version_badges + badge_offset,  
+                            sizeof(version_badges) - badge_offset,  
+                            "<span class='version-badge badge-v2'>v2</span>");  
+                has_any_version = 1;  
+            }  
+            if (h->success_v2s > 0)  
+            {  
+                badge_offset += snprintf(version_badges + badge_offset,  
+                            sizeof(version_badges) - badge_offset,  
+                            "<span class='version-badge badge-v2s'>v2s</span>");  
+                has_any_version = 1;  
+            }  
+            if (h->success_v3 > 0)  
+            {  
+                badge_offset += snprintf(version_badges + badge_offset,  
+                            sizeof(version_badges) - badge_offset,  
+                            "<span class='version-badge badge-v3'>v3</span>");  
+                has_any_version = 1;  
+            }  
+            if (!has_any_version)  
+            {  
+                snprintf(version_badges, sizeof(version_badges),  
+                            "<span class='version-badge badge-unknown'>未知</span>");  
             }
-            if (h->success_v2s > 0)
-            {
-                strcat(version_badges, "<span class='version-badge badge-v2s'>v2s</span>");
-                has_any_version = 1;
-            }
-            if (h->success_v3 > 0)
-            {
-                strcat(version_badges, "<span class='version-badge badge-v3'>v3</span>");
-                has_any_version = 1;
-            }
-            if (!has_any_version)
-            {
-                strcat(version_badges, "<span class='version-badge badge-unknown'>未知</span>");
-            }
-
+            
             // 计算该主机的连通率(基于历史记录)
             float overall_rate = calculate_uptime(h);
 
@@ -3397,60 +3407,107 @@ void generate_html(char *buf, size_t bufsize)
     pthread_rwlock_unlock(&g_state.lock);
 }
 
-void update_html_cache(void)
-{
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: 开始更新 HTML 缓存\n", timestamp());
-    }
-
-    // 计算所需缓冲区大小
-    pthread_rwlock_rdlock(&g_state.lock);
-    size_t base_size = 50000;
-    size_t per_host_size = 500 + (g_max_history * 50);
-    size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;
-
-    if (buffer_size < 262144)
-        buffer_size = 262144;
-    if (buffer_size > 10485760)
-        buffer_size = 10485760;
-
-    int host_count = g_state.host_count;
-    pthread_rwlock_unlock(&g_state.lock);
-
-    // 分配临时缓冲区
-    char *temp_buffer = malloc(buffer_size);
-    if (!temp_buffer)
-    {
-        fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓存缓冲区\n",
-                timestamp(), buffer_size);
-        return;
-    }
-
-    // 生成 HTML
-    generate_html(temp_buffer, buffer_size);
-    size_t html_len = strlen(temp_buffer);
-
-    // 更新全局缓存
-    pthread_rwlock_wrlock(&g_cache_lock);
-
-    // 释放旧缓存
-    if (g_html_cache)
-    {
-        free(g_html_cache);
-    }
-
-    // 设置新缓存
-    g_html_cache = temp_buffer;
-    g_html_cache_size = html_len;
-
-    pthread_rwlock_unlock(&g_cache_lock);
-
-    if (verbose)
-    {
-        fprintf(stderr, "[%s] [DEBUG]: HTML 缓存已更新 (%zu 字节, %d 个主机)\n",
-                timestamp(), html_len, host_count);
-    }
+void update_html_cache(void)  
+{  
+    struct timeval start_time, end_time;    
+    gettimeofday(&start_time, NULL);  
+      
+    if (verbose)  
+    {  
+        fprintf(stderr, "[%s] [DEBUG]: 开始更新 HTML 缓存\n", timestamp());  
+    }  
+  
+    // 计算所需缓冲区大小  
+    pthread_rwlock_rdlock(&g_state.lock);  
+    size_t base_size = 50000;  
+    size_t per_host_size = 500 + (g_max_history * 50);  
+    size_t buffer_size = base_size + (g_state.host_count * per_host_size) + 10000;  
+  
+    if (buffer_size < 262144)  
+        buffer_size = 262144;  
+    if (buffer_size > 10485760)  
+        buffer_size = 10485760;  
+  
+    int host_count = g_state.host_count;  
+    pthread_rwlock_unlock(&g_state.lock);  
+  
+    // 分配临时缓冲区  
+    struct timeval alloc_start;    
+    gettimeofday(&alloc_start, NULL);   
+    char *temp_buffer = malloc(buffer_size);  
+      
+    if (!temp_buffer)  
+    {  
+        fprintf(stderr, "[%s] [ERROR]: 无法分配 %zu 字节缓存缓冲区\n",  
+                timestamp(), buffer_size);  
+        return;  
+    }  
+  
+    struct timeval alloc_end;    
+    gettimeofday(&alloc_end, NULL);    
+    double alloc_sec = (alloc_end.tv_sec - alloc_start.tv_sec) +     
+                       (alloc_end.tv_usec - alloc_start.tv_usec) / 1000000.0;    
+    
+    // 生成 HTML    
+    struct timeval gen_start;    
+    gettimeofday(&gen_start, NULL);    
+        
+    generate_html(temp_buffer, buffer_size);    
+    size_t html_len = strlen(temp_buffer);    
+        
+    struct timeval gen_end;    
+    gettimeofday(&gen_end, NULL);    
+    double gen_sec = (gen_end.tv_sec - gen_start.tv_sec) +     
+                     (gen_end.tv_usec - gen_start.tv_usec) / 1000000.0;    
+    
+    // 更新全局缓存    
+    struct timeval lock_start;    
+    gettimeofday(&lock_start, NULL);    
+        
+    pthread_rwlock_wrlock(&g_cache_lock);    
+        
+    struct timeval lock_acquired;    
+    gettimeofday(&lock_acquired, NULL);    
+    double lock_wait_sec = (lock_acquired.tv_sec - lock_start.tv_sec) +     
+                           (lock_acquired.tv_usec - lock_start.tv_usec) / 1000000.0;    
+    
+    // 释放旧缓存    
+    if (g_html_cache)    
+    {    
+        free(g_html_cache);    
+    }    
+    
+    // 设置新缓存    
+    g_html_cache = temp_buffer;    
+    g_html_cache_size = html_len;    
+    
+    pthread_rwlock_unlock(&g_cache_lock);    
+    
+    gettimeofday(&end_time, NULL);    
+    double total_sec = (end_time.tv_sec - start_time.tv_sec) +     
+                       (end_time.tv_usec - start_time.tv_usec) / 1000000.0;    
+      
+    if (verbose)  
+    {  
+        // 输出详细性能日志    
+        fprintf(stderr, "[%s] [PERF]: HTML 主页缓存更新完成 - 总耗时: %.3fs "    
+            "(内存分配: %.3fs, HTML生成: %.3fs, 锁等待: %.3fs) | "    
+            "缓存大小: %zu 字节, 主机数: %d, 历史记录: %d条/主机\n",    
+            timestamp(), total_sec, alloc_sec, gen_sec, lock_wait_sec,    
+            html_len, host_count, g_max_history);    
+    }  
+        
+    // 性能警告    
+    if (total_sec > 1.0)    
+    {    
+        fprintf(stderr, "[%s] [WARN]: 主页缓存更新耗时过长 (%.3fs)，建议减少历史记录数量 (-j 参数)\n",    
+                timestamp(), total_sec);    
+    }    
+    if (lock_wait_sec > 0.1)    
+    {    
+        fprintf(stderr, "[%s] [WARN]: 主页缓存更新出现锁等待时间过长 (%.3fs)，可能存在锁竞争\n",    
+                timestamp(), lock_wait_sec);    
+    }    
 }
 
 // 不区分大小写查找请求头
@@ -4257,31 +4314,40 @@ static void call_status_change_script(host_stats_t *h, int is_online,
     // 构建版本字符串,防止为空
     char versions[64] = "";
     int has_version = 0;
-    if (v1_ok)
-    {
-        strcat(versions, "v1 ");
-        has_version = 1;
-    }
-    if (v2_ok)
-    {
-        strcat(versions, "v2 ");
-        has_version = 1;
-    }
-    if (v2s_ok)
-    {
-        strcat(versions, "v2s ");
-        has_version = 1;
-    }
-    if (v3_ok)
-    {
-        strcat(versions, "v3 ");
-        has_version = 1;
-    }
-
-    // 如果没有检测到任何版本,使用占位符
-    if (!has_version)
-    {
-        strcpy(versions, "Unknown");
+    int version_offset = 0;
+    if (v1_ok)  
+    {  
+        version_offset += snprintf(versions + version_offset,  
+                              sizeof(versions) - version_offset,  
+                              "v1 ");  
+        has_version = 1;  
+    }  
+    if (v2_ok)  
+    {  
+        version_offset += snprintf(versions + version_offset,  
+                              sizeof(versions) - version_offset,  
+                              "v2 ");  
+        has_version = 1;  
+    }  
+    if (v2s_ok)  
+    {  
+        version_offset += snprintf(versions + version_offset,  
+                              sizeof(versions) - version_offset,  
+                              "v2s ");  
+        has_version = 1;  
+    }  
+    if (v3_ok)  
+    {  
+        version_offset += snprintf(versions + version_offset,  
+                              sizeof(versions) - version_offset,  
+                              "v3 ");  
+        has_version = 1;  
+    }  
+  
+    // 如果没有检测到任何版本,使用占位符  
+    if (!has_version)  
+    {  
+        snprintf(versions, sizeof(versions), "Unknown");  
     }
 
     // 构建主机标识 - 使用真实主机名(h->host),不使用隐私名(display_name)
@@ -4620,9 +4686,9 @@ void handle_refresh_request(int client_sock)
             }
 
             pthread_rwlock_unlock(&g_state.lock);
-            // 更新 HTML 缓存
-            update_html_cache();
         }
+        // 更新 HTML 缓存
+        update_html_cache();
 
         if (verbose)
         {
@@ -4961,48 +5027,102 @@ void handle_http_request(int client_sock)
         char *xri = find_header_value(request, "X-Real-IP");
         char *cfip = find_header_value(request, "CF-Connecting-IP");
 
-        // 构建合并的消息
-        char proxy_info[2048] = {0};
-        int has_proxy_header = 0;
-
-        if (xff || xri || cfip)
-        {
-            strcat(proxy_info, "访问者IP: ");
-
-            if (xff)
-            {
-                char xff_value[256];
-                sscanf(xff, "%255[^\r\n]", xff_value);
-                strcat(proxy_info, "X-Forwarded-For=");
-                strcat(proxy_info, xff_value);
-                has_proxy_header = 1;
-            }
-
-            if (xri)
-            {
-                char xri_value[256];
-                sscanf(xri, "%255[^\r\n]", xri_value);
-                if (has_proxy_header)
-                    strcat(proxy_info, ", ");
-                strcat(proxy_info, "X-Real-IP=");
-                strcat(proxy_info, xri_value);
-                has_proxy_header = 1;
-            }
-
-            if (cfip)
-            {
-                char cfip_value[256];
-                sscanf(cfip, "%255[^\r\n]", cfip_value);
-                if (has_proxy_header)
-                    strcat(proxy_info, ", ");
-                strcat(proxy_info, "CF-Connecting-IP=");
-                strcat(proxy_info, cfip_value);
-            }
-            if (verbose)
-            {
-                // 输出合并后的消息
-                fprintf(stderr, "[%s] [DEBUG]: %s\n", timestamp(), proxy_info);
-            }
+        // 提取所有请求头的 IP 值  
+        char xff_value[256] = {0};  
+        char xri_value[256] = {0};  
+        char cfip_value[256] = {0};  
+  
+        if (xff)  
+        {  
+            sscanf(xff, "%255[^\r\n]", xff_value);  
+        }  
+        if (xri)  
+        {  
+            sscanf(xri, "%255[^\r\n]", xri_value);  
+        }  
+        if (cfip)  
+        {  
+            sscanf(cfip, "%255[^\r\n]", cfip_value);  
+        }  
+  
+        // 构建合并的消息  
+        char proxy_info[2048] = {0};  
+        int proxy_offset = 0;  
+  
+        if (xff || xri || cfip)  
+        {  
+            // 确定第一个非空的 IP 值  
+            char *first_ip = NULL;  
+            if (xff_value[0])  
+                first_ip = xff_value;  
+            else if (xri_value[0])  
+                first_ip = xri_value;  
+            else if (cfip_value[0])  
+                first_ip = cfip_value;  
+  
+            // 检查是否所有非空值都相同  
+            int all_same = 1;  
+            if (first_ip)  
+            {  
+                if (xff_value[0] && strcmp(xff_value, first_ip) != 0)  
+                    all_same = 0;  
+                if (xri_value[0] && strcmp(xri_value, first_ip) != 0)  
+                    all_same = 0;  
+                if (cfip_value[0] && strcmp(cfip_value, first_ip) != 0)  
+                    all_same = 0;  
+            }  
+  
+            if (all_same && first_ip)  
+            {  
+                // 所有 IP 相同,简化输出  
+                proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                sizeof(proxy_info) - proxy_offset,  
+                                "访问者IP: %s", first_ip);  
+            }  
+            else  
+            {  
+                // IP 不同,显示详细信息  
+                proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                sizeof(proxy_info) - proxy_offset,  
+                                "访问者IP: ");  
+                int has_proxy_header = 0;  
+  
+                if (xff_value[0])  
+                {  
+                    proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                    sizeof(proxy_info) - proxy_offset,  
+                                    "X-Forwarded-For=%s", xff_value);  
+                    has_proxy_header = 1;  
+                }  
+  
+                if (xri_value[0])  
+                {  
+                    if (has_proxy_header)  
+                        proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                        sizeof(proxy_info) - proxy_offset,  
+                                        ", ");  
+                        proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                    sizeof(proxy_info) - proxy_offset,  
+                                    "X-Real-IP=%s", xri_value);  
+                        has_proxy_header = 1;  
+                }  
+  
+                if (cfip_value[0])  
+                {  
+                    if (has_proxy_header)  
+                        proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                        sizeof(proxy_info) - proxy_offset,  
+                                        ", ");  
+                        proxy_offset += snprintf(proxy_info + proxy_offset,  
+                                    sizeof(proxy_info) - proxy_offset,  
+                                    "CF-Connecting-IP=%s", cfip_value);  
+                }  
+            }  
+  
+            if (verbose)  
+            {  
+                fprintf(stderr, "[%s] [DEBUG]: %s\n", timestamp(), proxy_info);  
+            }  
         }
 
         // 解析请求行: GET /api?supernode=host:port HTTP/1.1
@@ -5060,7 +5180,19 @@ void handle_http_request(int client_sock)
         }
 
         // ========== 使用缓存的 HTML ==========
-        pthread_rwlock_rdlock(&g_cache_lock);
+        struct timeval lock_start, lock_acquired;    
+        gettimeofday(&lock_start, NULL);  
+        pthread_rwlock_rdlock(&g_cache_lock);  
+  
+        gettimeofday(&lock_acquired, NULL);    
+        double lock_wait_sec = (lock_acquired.tv_sec - lock_start.tv_sec) +     
+                       (lock_acquired.tv_usec - lock_start.tv_usec) / 1000000.0;    
+  
+        if (lock_wait_sec > 0.05 && verbose)    
+        {    
+            fprintf(stderr, "[%s] [WARN]: 当前访问主页需要等待缓存锁 %.3fs (可能正在更新主页缓存)\n",    
+                timestamp(), lock_wait_sec);    
+        }
 
         if (g_html_cache && g_html_cache_size > 0)
         {
@@ -5104,10 +5236,10 @@ void handle_http_request(int client_sock)
             pthread_rwlock_unlock(&g_cache_lock);
 
             // 缓存未初始化,回退到实时生成
-            if (verbose)
-            {
+            // if (verbose)
+            // {
                 fprintf(stderr, "[%s] [WARN]: HTML 缓存未初始化,使用实时生成\n", timestamp());
-            }
+            // }
 
             // 动态生成代码作为后备
             pthread_rwlock_rdlock(&g_state.lock);
@@ -5362,9 +5494,9 @@ void *monitor_thread(void *arg)
             }
 
             pthread_rwlock_unlock(&g_state.lock);
-            // 更新 HTML 缓存
-            update_html_cache();
         }
+        // 更新 HTML 缓存
+        update_html_cache();
 
         if (verbose)
         {
@@ -6230,6 +6362,9 @@ int main(int argc, char *argv[])
             return 1;
         }
     }
+
+    // 生成 HTML 缓存
+    update_html_cache();
 
     // 启动监控线程
     pthread_t monitor_tid;
