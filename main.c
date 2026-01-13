@@ -390,7 +390,7 @@ static size_t build_register_super_v2(uint8_t *pktbuf, const char *community, ui
     sent_cookie[3] = 0xDD;
 
     memcpy(mac, g_mac, N2N_MAC_SIZE);
-    encode_common(pktbuf, &idx, 2, 2, 0, MSG_TYPE_REGISTER_SUPER, community, N2N_COMMUNITY_SIZE);
+    encode_common(pktbuf, &idx, 2, 2, 0, MSG_TYPE_REGISTER_SUPER, community, COMMUNITY_LEN);
     encode_buf(pktbuf, &idx, sent_cookie, N2N_COOKIE_SIZE);
     encode_buf(pktbuf, &idx, mac, N2N_MAC_SIZE);
     encode_uint32(pktbuf, &idx, 0);
@@ -472,7 +472,7 @@ static int is_valid_v1_ack(const uint8_t *buf, size_t len)
 
 static int is_valid_v2_ack(const uint8_t *buf, size_t len, const uint8_t *expected_cookie)
 {
-    if (len < 28)
+    if (len < 24)
         return 0;
 
     uint16_t flags_pc = (buf[2] << 8) | buf[3];
@@ -480,7 +480,7 @@ static int is_valid_v2_ack(const uint8_t *buf, size_t len, const uint8_t *expect
     if (pc != 6)
         return 0;
 
-    const uint8_t *received_cookie = buf + 24;
+    const uint8_t *received_cookie = buf + 20;
     int cookie_match = memcmp(received_cookie, expected_cookie, N2N_COOKIE_SIZE) == 0;
     if (verbose)
     {
